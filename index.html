@@ -1,186 +1,656 @@
-'use strict';
-// Nix server: serves the site, handles accounts (cookie sessions) and a moderated global chat.
-// No dependencies. Run: node server.js   (Node 18+)
-const http = require('http'), crypto = require('crypto'), fs = require('fs'), path = require('path'), { promisify } = require('util');
-const scrypt = promisify(crypto.scrypt), E = process.env;
-const PORT = +E.PORT || 3000, PROD = E.NODE_ENV === 'production';
-const list = s => (s || '').split(',').map(x => x.trim()).filter(Boolean);
-const ADMINS = list(E.ADMINS).map(x => x.toLowerCase());       // usernames that can moderate
-const ORIGINS = list(E.ALLOWED_ORIGINS);                         // extra origins allowed to call the API
-const FILE = E.DATA_FILE || path.join(__dirname, 'data.json');
-const BLOCK = ['fuck', 'shit', 'bitch', 'cunt', 'nigg', 'fag', 'porn', 'whore', ...list(E.BLOCKED_WORDS).map(x => x.toLowerCase())];
-const LINK = /(https?:|www\.|\b[\w-]+\.(com|net|org|io|gg|xyz|lol|me|tv|co)\b|[\w.+-]+@[\w-]+\.\w+|\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b)/i;
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nix</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--ac:#4f8ef7;--acrgb:79,142,247;--bg:#0d0f1a;--card:rgba(255,255,255,.05);--glass:rgba(255,255,255,.07);--bd:rgba(255,255,255,.1);--tx:#eef0ff;--tx2:#8892b0;--tx3:#5a6280;--cs:155px;--gap:13px;--r:14px;--blur:14px;--snow:1;--steam:1;--font:'Space Grotesk',system-ui,sans-serif}
+[data-theme=light]{--bg:#f0f2fa;--card:rgba(255,255,255,.75);--glass:rgba(255,255,255,.85);--bd:rgba(0,0,0,.12);--tx:#1a1e3a;--tx2:#4a5270;--tx3:#8a90ae}
+[data-perf=low]{--blur:0px;--snow:0;--steam:0}
+[data-perf=med]{--blur:4px;--snow:.5;--steam:.5}
+[data-layout=compact]{--cs:118px;--gap:9px}
+*{box-sizing:border-box;margin:0;padding:0;font-family:inherit}
+html,body{height:100%;overflow:hidden}
+body{background:var(--bg);color:var(--tx);font-family:var(--font);transition:background .3s,color .3s}
+button,input{color:inherit;font-size:inherit}button{cursor:pointer;background:none;border:0}
+svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.hidden{display:none!important}
+#wall{position:fixed;inset:0;background:center/cover;opacity:0;z-index:0;pointer-events:none}
+#snow,#steam{position:fixed;inset:0;pointer-events:none;z-index:1;overflow:hidden;transition:opacity .4s}
+#snow{opacity:var(--snow)}#steam{opacity:var(--steam)}
+#snow::before,#snow::after{content:"";position:absolute;left:0;right:0;top:-600px;bottom:0;background-image:var(--flakes);background-size:600px 600px;animation:fall 20s linear infinite}
+#snow::after{animation-duration:34s;background-position:240px 120px;opacity:.7}
+@keyframes fall{to{transform:translateY(600px)}}
+.sp{position:absolute;bottom:-20px;border-radius:50%;background:rgba(var(--acrgb),.4);filter:blur(3px);animation:rise linear infinite}
+@keyframes rise{to{transform:translate(var(--sx),-110vh);opacity:0}}
+#loader{position:fixed;inset:0;z-index:20000;background:var(--bg);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;transition:opacity .5s}
+#loader.hide{opacity:0;pointer-events:none}
+.logo{font-size:2.2rem;font-weight:700;letter-spacing:2px}.logo em{color:var(--ac);font-style:normal}
+.bar{width:180px;height:3px;background:var(--bd);border-radius:3px;overflow:hidden}.bar i{display:block;height:100%;background:var(--ac);animation:ld 1.2s ease forwards}
+@keyframes ld{from{width:0}}
+#app{position:relative;z-index:2;height:100%;display:flex;flex-direction:column}
+nav{flex:none;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 14px;background:var(--glass);backdrop-filter:blur(var(--blur));border-bottom:1px solid var(--bd);position:relative;z-index:50}
+.nl,.nr{display:flex;align-items:center;gap:8px;flex:1;min-width:0}.nr{justify-content:flex-end}
+.rel{position:relative}
+.sw{position:relative;flex:1;max-width:260px}.sw svg{position:absolute;left:11px;top:9px;color:var(--tx2)}
+#q{width:100%;height:34px;padding:0 12px 0 34px;border-radius:20px;border:1px solid var(--bd);background:var(--card);outline:0}
+#q:focus{border-color:var(--ac)}
+.ib{width:34px;height:34px;border-radius:50%;border:1px solid var(--bd);background:var(--card);display:grid;place-items:center;flex:none}
+.tabs{display:flex;gap:4px;background:var(--card);border-radius:20px;padding:3px}
+.tab{display:flex;align-items:center;gap:6px;padding:6px 13px;border-radius:16px;font-size:13px;color:var(--tx2)}
 
-/* ---------- storage (JSON file, flushed every 2s) ---------- */
-let DB = { users: {}, sessions: {}, msgs: [], reports: [], nextId: 1 }, dirty = false;
-try { DB = { ...DB, ...JSON.parse(fs.readFileSync(FILE, 'utf8')) }; } catch { }
-const touch = () => { dirty = true; };
-function flush() { if (!dirty) return; dirty = false; fs.writeFileSync(FILE + '.tmp', JSON.stringify(DB)); fs.renameSync(FILE + '.tmp', FILE); }
-setInterval(flush, 2000);
-for (const s of ['SIGINT', 'SIGTERM']) process.on(s, () => { flush(); process.exit(0); });
+.dd{display:none;position:absolute;top:calc(100% + 8px);left:0;min-width:200px;background:var(--bg);border:1px solid var(--bd);border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,.45);z-index:60;overflow:hidden}
+.dd.open{display:block}
+#sug{width:100%}#sortdd{min-width:170px}
+#setdd{left:auto;right:0;width:min(92vw,340px);max-height:80vh;overflow:auto;padding:14px}
+.opt{display:block;width:100%;text-align:left;padding:9px 14px;font-size:13px}.opt:hover,.opt.on{background:rgba(var(--acrgb),.18)}
+.opt small{float:right;color:var(--tx3)}.opt.dym{color:var(--tx2)}
+main{flex:1;overflow:auto;padding:6px 18px 40px}
+.lbl{font-size:12px;letter-spacing:1.5px;text-transform:uppercase;color:var(--tx2);margin:16px 0 10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--cs),1fr));gap:var(--gap)}
+.card{position:relative;aspect-ratio:1;border-radius:var(--r);background:var(--card);border:1px solid var(--bd);display:flex;flex-direction:column;overflow:hidden;cursor:pointer;content-visibility:auto;contain-intrinsic-size:var(--cs) var(--cs);}
+.em{flex:1;display:grid;place-items:center;font-size:2.6rem}
+.nm{padding:8px 10px;font-size:12px;font-weight:500;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;background:rgba(0,0,0,.25)}
+.fav{position:absolute;top:6px;right:6px;width:26px;height:26px;display:grid;place-items:center;border-radius:50%;background:rgba(0,0,0,.4);color:#fff;font-size:13px}
+.fav.on{color:#ffc93c}
+.cat{position:absolute;top:6px;left:6px;font-size:9px;padding:2px 7px;border-radius:10px;background:rgba(var(--acrgb),.85);color:#fff}
+.anim{animation:pop .4s backwards}@keyframes pop{from{opacity:0;transform:translateY(10px)}}
+.chips{display:flex;gap:8px;overflow-x:auto;padding:8px 6px}
+.chip{flex:none;padding:7px 12px;border-radius:20px;background:var(--card);border:1px solid var(--bd);font-size:12px;white-space:nowrap}
+.none{text-align:center;color:var(--tx2);padding:50px 0}.none b{display:block;font-size:2rem;margin-bottom:6px}
+.ov{position:fixed;inset:0;z-index:9000;display:none;background:rgba(0,0,0,.55);backdrop-filter:blur(4px);align-items:center;justify-content:center}
+.ov.show{display:flex}
+.box{background:var(--bg);border:1px solid var(--bd);border-radius:var(--r);width:min(92vw,440px);max-height:86vh;display:flex;flex-direction:column;box-shadow:0 12px 40px rgba(0,0,0,.5)}
+.hd{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:14px 16px;border-bottom:1px solid var(--bd);font-weight:600}
+.x{width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:var(--card);flex:none}
+.bd{padding:14px 16px;overflow:auto}
+.sec{margin-bottom:16px}.st{font-size:11px;letter-spacing:1.2px;text-transform:uppercase;color:var(--tx2);margin-bottom:8px}
+.row{display:flex;gap:8px;align-items:center;margin-bottom:6px}
+.btn{flex:1;padding:9px 10px;border-radius:9px;border:1px solid var(--bd);background:var(--card);font-size:12px}
+.btn.danger{color:#ff7090;border-color:rgba(255,50,90,.4)}
+.inp{width:100%;padding:8px 10px;border-radius:9px;border:1px solid var(--bd);background:var(--card);outline:0;margin-bottom:6px}.inp:focus{border-color:var(--ac)}
+.tog{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:6px 0;font-size:13px}.tog small{display:block;color:var(--tx3);font-size:11px}
+.tog input{width:36px;height:18px;accent-color:var(--ac);flex:none}
+.dots{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}.dot{width:24px;height:24px;border-radius:50%;border:2px solid var(--bd)}.dot:hover{border-color:var(--tx)}
+.fonts{display:grid;grid-template-columns:1fr 1fr;gap:6px}.fonts .btn{flex:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+input[type=range]{width:100%;accent-color:var(--ac)}
+.lb{font-size:10px;color:var(--tx3);letter-spacing:1px;margin:6px 0 2px}
+.play{width:100%;padding:11px;border-radius:10px;border:1px solid var(--ac);color:#fff;font-weight:700;letter-spacing:1px;background:#1a1a1a}
+#pp{text-align:center;margin-bottom:8px;pointer-events:none}
+.mh{display:flex;align-items:center;gap:12px}.mi{font-size:2rem}.mt{font-size:12px;color:var(--tx2)}
+.hp{border:1px solid var(--bd);border-radius:10px;margin-bottom:8px;padding:10px 12px;background:var(--card)}
+.hp summary{cursor:pointer;font-weight:600;font-size:13px}.hp p{margin-top:8px;font-size:12px;line-height:1.6;color:var(--tx2)}
+.cl{font-size:12px;color:var(--tx2);line-height:1.5;margin-bottom:6px}.cl b{color:var(--ac)}
+#viewer{position:fixed;inset:0;z-index:10000;display:none;flex-direction:column;background:var(--bg)}
+#viewer.show{display:flex}
+.vb{display:flex;align-items:center;justify-content:space-between;padding:8px 14px;border-bottom:1px solid var(--bd);font-weight:600}
+#frame{flex:1;width:100%;border:0;background:#000}
+#dbg{position:fixed;left:10px;bottom:10px;z-index:9500;background:rgba(0,0,0,.75);color:#8f8;font:11px monospace;padding:8px 10px;border-radius:8px;line-height:1.5}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:30000;padding:10px 18px;border-radius:10px;color:#fff;font-size:13px;background:rgba(var(--acrgb),.92)}
+.toast.err{background:rgba(220,50,80,.92)}
 
-/* ---------- helpers ---------- */
-const sha = s => crypto.createHash('sha256').update(s).digest('hex');
-const leet = s => s.toLowerCase().replace(/[0@]/g, 'o').replace(/[1!|]/g, 'i').replace(/3/g, 'e').replace(/4/g, 'a').replace(/[5$]/g, 's').replace(/[^a-z]/g, '');
-const rude = s => BLOCK.some(w => leet(s).includes(w));
-const isAdmin = u => ADMINS.includes(u.name.toLowerCase());
-const pub = u => ({ name: u.name, admin: isAdmin(u) });
-const cookies = h => Object.fromEntries((h || '').split(';').map(c => { const i = c.indexOf('='); return i < 0 ? [''] : [c.slice(0, i).trim(), c.slice(i + 1).trim()]; }).filter(x => x[0]));
-const ip = req => (PROD && E.TRUST_PROXY ? String(req.headers['x-forwarded-for'] || '').split(',').pop().trim() : '') || req.socket.remoteAddress;
-function sessionUser(req) {
-  const t = cookies(req.headers.cookie).nix_sid; if (!t) return null;
-  const s = DB.sessions[sha(t)]; if (!s || s.exp < Date.now()) return null;
-  const u = DB.users[s.u]; return u && !u.banned ? u : null;
+/* button style: radial gradient, glowing bottom line, scale+lift on hover (original radii kept) */
+:root{--b1:rgba(71,81,92,.30);--b2:rgba(255,255,255,.04);--bt:rgba(255,255,255,.66);--bth:rgb(255,255,255);--bl:255,255,255;--bin:rgba(255,255,255,.1);--ease:cubic-bezier(.15,.83,.66,1)}
+[data-theme=light]{--b1:rgba(255,255,255,.75);--b2:rgba(205,212,234,.30);--bt:rgba(26,30,58,.66);--bth:rgb(26,30,58);--bl:26,30,58;--bin:rgba(0,0,0,.1)}
+.card,.btn:not(.on),.chip,.ib,.tab:not(.on),.play{position:relative;border-color:transparent;box-shadow:inset 0 0 0 1px var(--bd);background:radial-gradient(ellipse at bottom,var(--b1) 0%,var(--b2) 45%);color:var(--bt);transition:all 1s var(--ease)}
+.btn.danger:not(.on){color:#ff7090}.play{color:#fff}
+.card::before,.btn::before,.chip::before,.ib::before,.tab::before,.play::before{content:"";width:70%;height:1px;position:absolute;bottom:0;left:15%;pointer-events:none;background:linear-gradient(90deg,rgba(var(--bl),0) 0%,rgba(var(--bl),1) 50%,rgba(var(--bl),0) 100%);opacity:.2;transition:all 1s var(--ease)}
+.card:hover,.btn:hover,.chip:hover,.ib:hover,.tab:hover,.play:hover{color:var(--bth);transform:scale(1.1) translateY(-3px);z-index:3}
+.btn.danger:hover{color:#ff7090}.play:hover{color:#fff}
+.card:hover::before,.btn:hover::before,.chip:hover::before,.ib:hover::before,.tab:hover::before,.play:hover::before{opacity:1}
+[data-perf=low] .card,[data-perf=low] .card::before{transition-duration:.2s}
+/* selected state: semi-transparent like the search bar */
+.tab.on,.btn.on{background:rgba(var(--acrgb),.22);box-shadow:inset 0 0 0 1px rgba(var(--acrgb),.55);border-color:transparent;color:var(--tx);backdrop-filter:blur(var(--blur));transition:all 1s var(--ease)}
+.tab.on:hover,.btn.on:hover{color:var(--tx)}
+.msgs{height:min(46vh,320px);overflow:auto;border:1px solid var(--bd);border-radius:12px;padding:8px 10px;margin-bottom:8px;background:var(--card);font-size:13px}
+.m{padding:3px 0;word-break:break-word;line-height:1.4}.m b{color:var(--ac)}.m small{color:var(--tx3);margin-left:6px}.m i{font-style:normal;color:var(--tx3);cursor:pointer;margin-left:6px;opacity:0}.m:hover i{opacity:1}.m.sys{color:var(--tx2);font-style:italic}
+.bdg{position:absolute;top:-4px;right:-4px;min-width:16px;height:16px;border-radius:8px;background:#e5484d;color:#fff;font-size:10px;display:grid;place-items:center;padding:0 4px;pointer-events:none}
+@media(max-width:720px){nav{flex-wrap:wrap}.tabs{order:3;width:100%;justify-content:center}.nl,.nr{flex:none}.nl{flex:1}main{padding:4px 12px 40px}}
+@media(prefers-reduced-motion:reduce){*{animation-duration:.01s!important}}
+</style>
+</head>
+<body>
+<div id="wall"></div><div id="snow"></div><div id="steam"></div>
+<div id="loader"><div class="logo"><em>N</em>ix</div><div style="color:var(--tx2)">Your Ultimate Game Portal</div><div class="bar"><i></i></div></div>
+<div id="dbg" class="hidden"></div>
+<div id="app">
+<nav>
+ <div class="nl">
+  <div class="sw rel"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg><input id="q" placeholder="Search games..." autocomplete="off" spellcheck="false"><div class="dd" id="sug"></div></div>
+  <div class="rel"><button class="ib" data-dd="sortdd" title="Sort games"><svg viewBox="0 0 24 24"><path d="M3 6h18M3 12h12M3 18h6"/></svg></button><div class="dd" id="sortdd"></div></div>
+ </div>
+ <div class="tabs">
+  <button class="tab on" data-sec="home"><svg viewBox="0 0 24 24"><path d="M3 9l9-7 9 7v11H3z"/></svg>Games</button>
+  <button class="tab" data-sec="favs"><svg viewBox="0 0 24 24"><path d="M12 2l3 6.3 7 1-5 4.9 1.2 6.9-6.2-3.3-6.2 3.3L7 14.2 2 9.3l7-1z"/></svg>Favorites</button>
+  <button class="tab" data-sec="recents"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>Recent</button>
+ </div>
+ <div class="nr">
+  <button class="ib" data-open="more" title="More"><svg viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  <button class="ib" data-open="help" title="Help"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M9.1 9a3 3 0 015.8 1c0 2-3 3-3 3M12 17h.01"/></svg></button>
+  <button class="ib" data-open="chat" title="Chat"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg><span class="bdg hidden" id="cbadge"></span></button>
+  <button class="ib" data-open="account" title="Account"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/></svg></button>
+  <div class="rel"><button class="ib" data-dd="setdd" title="Settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg></button><div class="dd" id="setdd"></div></div>
+ </div>
+</nav>
+<main>
+ <section id="s-home">
+  <div id="rec" class="hidden"><div class="lbl">Recently Played</div><div class="chips" id="recrow"></div></div>
+  <div id="favh" class="hidden"><div class="lbl">★ Favorites</div><div class="grid" id="favgrid"></div></div>
+  <div class="lbl" id="alllbl">All Games</div><div class="grid" id="grid"></div>
+  <div class="none hidden" id="nores"><b>🔍</b>No games found<p id="dym" style="margin-top:8px"></p></div>
+ </section>
+ <section id="s-favs" class="hidden"><div class="lbl">★ Your Favorites</div><div class="grid" id="favfull"></div><div class="none hidden" id="nofav"><b>★</b>No favorites yet<p>Tap the star on any game to add it here</p></div></section>
+ <section id="s-recents" class="hidden"><div class="lbl">Recently Played</div><div class="grid" id="recgrid"></div><div class="none hidden" id="norec"><b>🕒</b>No recent games<p>Play a game to see it here</p></div></section>
+</main>
+</div>
+<div class="ov" id="modal"><div class="box"><div class="hd"><div class="mh"><div class="mi" id="gmi"></div><div><div id="gmn"></div><div class="mt" id="gmt"></div></div></div><button class="x" data-close>✕</button></div>
+ <div class="bd"><p class="cl" id="gmd"></p><div class="row"><button class="play" id="play" data-act="play" style="flex:1"></button><button class="btn" id="mfav" data-act="favmodal" style="flex:none;font-size:18px"></button></div></div></div></div>
+<div class="ov" id="panel"><div class="box" style="width:min(92vw,480px)"><div class="hd"><span id="pt"></span><button class="x" data-close>✕</button></div><div class="bd" id="pb"></div></div></div>
+<div id="viewer"><div class="vb"><span id="vt"></span><button class="btn" style="flex:none" data-act="closeviewer">Close ✕</button></div><iframe id="frame" title="Game" sandbox="allow-scripts allow-same-origin allow-pointer-lock allow-forms allow-popups" allow="autoplay; fullscreen; gamepad"></iframe></div>
+<script>
+const DB=[  {n:"1 on 1 Soccer",f:"cl1on1soccer",e:"⚽",c:"Sports"},{n:"1v1.LOL",f:"cl1v1lol",e:"🎯",c:"Action"},
+  {n:"2048",f:"cl2048",e:"🔢",c:"Puzzle"},{n:"2048 Cupcakes",f:"cl2048cupcakes",e:"🧁",c:"Puzzle"},
+  {n:"3 Pandas",f:"cl3pandas",e:"🐼",c:"Puzzle"},{n:"3 Pandas Brazil",f:"cl3pandasbrazil",e:"🐼",c:"Puzzle"},
+  {n:"3 Pandas Fantasy",f:"cl3pandasfantasy",e:"🐼",c:"Puzzle"},{n:"40x Escape",f:"cl40xescape",e:"🚪",c:"Puzzle"},
+  {n:"60 Seconds Burger Run",f:"cl60secondsburgerrun",e:"🍔",c:"Action"},{n:"8 Ball Pool",f:"cl8ballpool",e:"🎱",c:"Sports"},
+  {n:"99 Balls",f:"cl99balls",e:"🔵",c:"Puzzle"},{n:"A Dark Room",f:"clADarkRoom",e:"🕯️",c:"RPG"},
+  {n:"Ace Combat 2",f:"clacecombat2",e:"✈️",c:"Action"},{n:"Ace Combat 3",f:"clacecombat3",e:"✈️",c:"Action"},
+  {n:"Achievement Unlocked",f:"clachievementunlocked",e:"🏆",c:"Puzzle"},{n:"Adventure Capitalist",f:"cladventurecapitalist",e:"💰",c:"Idle"},
+  {n:"Age of War",f:"clageofwar",e:"⚔️",c:"Strategy"},{n:"Age of War 2",f:"clageofwar2",e:"⚔️",c:"Strategy"},
+  {n:"Alien Hominid",f:"clalienhominid",e:"👽",c:"Action"},{n:"Amigo Pancho",f:"clamigopancho",e:"🎈",c:"Puzzle"},
+  {n:"Amigo Pancho 2",f:"clamigopancho2",e:"🎈",c:"Puzzle"},{n:"Among Us",f:"clamongus",e:"🔴",c:"Multiplayer"},
+  {n:"Amorphous+",f:"clamorphous",e:"🟢",c:"Action"},{n:"Angry Birds",f:"clangrybirds",e:"🐦",c:"Puzzle"},
+  {n:"Angry Birds Space",f:"clangrybirdsspace",e:"🚀",c:"Puzzle"},{n:"Animal Crossing Wild World",f:"clanimalcrossingwildworld",e:"🌿",c:"Simulation"},
+  {n:"Apotris",f:"clapotris",e:"🧩",c:"Puzzle"},{n:"Aqua Park.io",f:"claquaparkio",e:"💧",c:"Multiplayer"},
+  {n:"Archers World Tour",f:"clarcheryworldtour",e:"🏹",c:"Sports"},{n:"Asteroids",f:"clasteroids",e:"☄️",c:"Action"},
+  {n:"Attack Hole",f:"clattackhole",e:"⚫",c:"Action"},{n:"Awesome Planes",f:"clawesomeplanes",e:"✈️",c:"Action"},
+  {n:"Awesome Tanks",f:"clawesometanks",e:"🪖",c:"Action"},{n:"Awesome Tanks 2",f:"clawesometanks2",e:"🪖",c:"Action"},
+  {n:"Baby Kaizo",f:"clbabykaizo",e:"👶",c:"Platformer"},{n:"Backrooms",f:"clbackrooms",e:"🟨",c:"Horror"},
+  {n:"Backyard Baseball",f:"clbackyardbaseball",e:"⚾",c:"Sports"},{n:"Bacon May Die",f:"clbaconmaydie",e:"🥓",c:"Action"},
+  {n:"Bad Ice Cream",f:"clbadicecream",e:"🍦",c:"Action"},{n:"Bad Parenting",f:"clbadparenting",e:"👨‍👧",c:"Puzzle"},
+  {n:"Bad Piggies",f:"clbadpiggies",e:"🐷",c:"Puzzle"},{n:"Baldi's Basics",f:"clbaldisbasics",e:"📏",c:"Horror"},
+  {n:"Ball Blast",f:"clballblast",e:"💣",c:"Action"},{n:"Banana Simulator",f:"clbananasimulator",e:"🍌",c:"Simulation"},
+  {n:"Banjo-Kazooie",f:"clbanjokazooie",e:"🐻",c:"Platformer"},{n:"Banjo-Tooie",f:"clbanjotooie",e:"🐻",c:"Platformer"},
+  {n:"Baseball Bros",f:"clbaseballbros",e:"⚾",c:"Sports"},{n:"Basketball Legends",f:"clbasketballlegends",e:"🏀",c:"Sports"},
+  {n:"Basketball Stars",f:"clbasketballstars",e:"🏀",c:"Sports"},{n:"Basket Random",f:"clbasketrandom",e:"🏀",c:"Sports"},
+  {n:"Battle Zone",f:"clbattlezone",e:"🪖",c:"Action"},{n:"Bazooka Boy",f:"clbazookaboy",e:"💥",c:"Action"},
+  {n:"Bear Barians",f:"clbearbarians",e:"🐻",c:"Action"},{n:"Ben 10 Alien Force",f:"clben10alienforce",e:"👾",c:"Action"},
+  {n:"Big Tower Tiny Square",f:"clbigtowertinysquare",e:"🟥",c:"Platformer"},{n:"Big Tower Tiny Square 2",f:"clbigtowertinysquare2",e:"🟥",c:"Platformer"},
+  {n:"BitLife",f:"clbitlife",e:"👤",c:"Simulation"},{n:"Blackjack",f:"clblackjack",e:"🃏",c:"Card"},
+  {n:"Block Blast",f:"clblockblast",e:"🟦",c:"Puzzle"},{n:"Block Post",f:"clblockpost",e:"🏗️",c:"Action"},
+  {n:"Blocky Snakes",f:"clblockysnakes",e:"🐍",c:"Arcade"},{n:"Bloons TD 1",f:"clbloonsTD1",e:"🎈",c:"Strategy"},
+  {n:"Bloons TD 2",f:"clbloonsTD2",e:"🎈",c:"Strategy"},{n:"Bloons TD 3",f:"clbloonsTD3",e:"🎈",c:"Strategy"},
+  {n:"Bloons TD 4",f:"clbloonsTD4",e:"🎈",c:"Strategy"},{n:"Bloons TD 5",f:"clbloonsTD5",e:"🎈",c:"Strategy"},
+  {n:"Bloxorz",f:"clbloxorz",e:"📦",c:"Puzzle"},{n:"Bob the Robber",f:"clbobtherobber",e:"🕵️",c:"Puzzle"},
+  {n:"Bob the Robber 2",f:"clbobtherobber2",e:"🕵️",c:"Puzzle"},{n:"Bomberman",f:"clbomberman",e:"💣",c:"Action"},
+  {n:"Bounce Masters",f:"clbouncemasters",e:"⬆️",c:"Action"},{n:"Boxing Random",f:"clboxingrandom",e:"🥊",c:"Sports"},
+  {n:"Bubble Shooter",f:"clbubbleshooter",e:"🫧",c:"Puzzle"},{n:"Bubble Tanks 2",f:"clbubbletanks2",e:"🫧",c:"Action"},
+  {n:"Buckshot Roulette",f:"clbuckshotroulette",e:"🔫",c:"Action"},{n:"Build Now GG",f:"clbuildnowgg",e:"🏗️",c:"Action"},
+  {n:"Burrito Bison",f:"clburritobison",e:"🌯",c:"Action"},{n:"Burrito Bison 2",f:"clburritobison2",e:"🌯",c:"Action"},
+  {n:"Burrito Bison Revenge",f:"clburritobisonrevenge",e:"🌯",c:"Action"},{n:"Cactus McCoy",f:"clcactusmccoy",e:"🌵",c:"Action"},
+  {n:"Cactus McCoy 2",f:"clcactusmccoy2",e:"🌵",c:"Action"},{n:"Capybara Clicker",f:"clcapybaraclicker",e:"🦫",c:"Idle"},
+  {n:"Castle Wars Modern",f:"clcastlewarsmodern",e:"🏰",c:"Strategy"},{n:"Cat Mario",f:"clcatmario",e:"🐱",c:"Platformer"},
+  {n:"Cave Story",f:"clcavestory",e:"🗿",c:"Platformer"},{n:"Celeste",f:"clceleste",e:"🏔️",c:"Platformer"},
+  {n:"Chaos Faction 2",f:"clchaosfaction2",e:"💥",c:"Action"},{n:"Checkers",f:"clcheckers",e:"♟️",c:"Board"},
+  {n:"Chess",f:"clchess",e:"♟️",c:"Board"},{n:"Choppy Orc",f:"clchoppyorc",e:"🧌",c:"Action"},
+  {n:"Chrono Trigger",f:"clchronotrigger",e:"⏳",c:"RPG"},{n:"Civiballs",f:"clciviballs",e:"⚙️",c:"Puzzle"},
+  {n:"Clash of Vikings",f:"clclashofvikings",e:"⚔️",c:"Strategy"},{n:"Cluster Rush",f:"clclusterrush",e:"🚛",c:"Action"},
+  {n:"COD Modern Warfare",f:"clcodmodernwarfare",e:"🔫",c:"Shooter"},{n:"Cookie Clicker",f:"clcookieclicker",e:"🍪",c:"Idle"},
+  {n:"Cooking Mama",f:"clcookingmama",e:"👩‍🍳",c:"Simulation"},{n:"Cooking Mama 2",f:"clcookingmama2",e:"👩‍🍳",c:"Simulation"},
+  {n:"Coreball",f:"clcoreball",e:"⚪",c:"Puzzle"},{n:"Counter Strike 1.6",f:"clcs1.6",e:"🔫",c:"Shooter"},
+  {n:"Crazy Cars",f:"clcrazycars",e:"🚗",c:"Racing"},{n:"Crazy Motorcycle",f:"clcrazymotorcycle",e:"🏍️",c:"Racing"},
+  {n:"Creeper World 2",f:"clcreeperworld2",e:"🟢",c:"Strategy"},{n:"Crossy Road",f:"clcrossyroad",e:"🐔",c:"Arcade"},
+  {n:"Cut the Rope",f:"clcuttherope",e:"🍬",c:"Puzzle"},{n:"Dad 'n Me",f:"cldadnme",e:"👊",c:"Action"},
+  {n:"Dead Plate",f:"cldeadplate",e:"🍽️",c:"Horror"},{n:"Decision",f:"cldecision",e:"🧟",c:"Action"},
+  {n:"Decision 2",f:"cldecision2",e:"🧟",c:"Action"},{n:"Decision 3",f:"cldecision3",e:"🧟",c:"Action"},
+  {n:"Deeper Sleep",f:"cldeepersleep",e:"😴",c:"Horror"},{n:"Defend Your Castle",f:"cldefendyourcastle",e:"🏰",c:"Strategy"},
+  {n:"Deltarune",f:"cldeltarune",e:"💜",c:"RPG"},{n:"Diamond Hollow 2",f:"cldiamondhollow2",e:"💎",c:"Platformer"},
+  {n:"Die in the Dungeon",f:"cldieinthedungeon",e:"🎲",c:"RPG"},{n:"Dig Dug",f:"cldigdug",e:"⛏️",c:"Arcade"},
+  {n:"Dino Dudes",f:"cldinodudes",e:"🦕",c:"Strategy"},{n:"Doblox",f:"cldoblox",e:"📦",c:"Action"},
+  {n:"Doge Miner",f:"cldogeminer",e:"🐕",c:"Idle"},{n:"Doge Miner 2",f:"cldogeminer2",e:"🐕",c:"Idle"},
+  {n:"Doki Doki Literature Club",f:"cldokidokiliteratureclub",e:"📚",c:"Visual Novel"},
+  {n:"Donkey Kong",f:"cldonkeykong",e:"🦍",c:"Platformer"},{n:"Donkey Kong 64",f:"cldonkeykong64",e:"🦍",c:"Platformer"},
+  {n:"Donkey Kong Country",f:"cldonkeykongcountry",e:"🦍",c:"Platformer"},{n:"Don't Escape",f:"cldontescape",e:"🚪",c:"Puzzle"},
+  {n:"Doodle Jump",f:"cldoodlejump",e:"📱",c:"Platformer"},{n:"Doom",f:"cldoom",e:"💀",c:"Shooter"},
+  {n:"Doom 2",f:"cldoom2",e:"💀",c:"Shooter"},{n:"Doom 64",f:"cldoom64",e:"💀",c:"Shooter"},
+  {n:"Dr. Mario",f:"cldrmario",e:"💊",c:"Puzzle"},{n:"Draw Climber",f:"cldrawclimber",e:"✏️",c:"Casual"},
+  {n:"Drift Boss",f:"cldriftboss",e:"🚗",c:"Racing"},{n:"Duck Hunt",f:"clduckhunt",e:"🦆",c:"Shooter"},
+  {n:"Duck Life",f:"clducklife",e:"🐥",c:"Simulation"},{n:"Duck Life 2",f:"clducklife2",e:"🐥",c:"Simulation"},
+  {n:"Duck Life 3",f:"clducklife3",e:"🐥",c:"Simulation"},{n:"Duck Life 4",f:"clducklife4",e:"🐥",c:"Simulation"},
+  {n:"Duck Life Battle",f:"clducklifebattle",e:"🐥",c:"Simulation"},{n:"Duck Life Space",f:"clducklifespace",e:"🐥",c:"Simulation"},
+  {n:"Duke Nukem 3D",f:"cldukenukem3d",e:"💥",c:"Shooter"},{n:"Dungeons & Degenerate Gamblers",f:"cldungeonsanddegenerategamblers",e:"🎰",c:"Card"},
+  {n:"Dusk Child",f:"clduskchild",e:"🌑",c:"RPG"},{n:"Earn to Die",f:"clearntodie",e:"🚗",c:"Action"},
+  {n:"Earn to Die 2",f:"clearntodie2",e:"🚗",c:"Action"},{n:"Earthbound",f:"clearthbound",e:"🌍",c:"RPG"},
+  {n:"Earthworm Jim",f:"clearthwormjim",e:"🪱",c:"Platformer"},{n:"Electric Man 2",f:"clelectricman2",e:"⚡",c:"Action"},
+  {n:"Endless War 4",f:"clendlesswar4",e:"⚔️",c:"Action"},{n:"Endless War 5",f:"clendlesswar5",e:"⚔️",c:"Action"},
+  {n:"Endless War 7",f:"clendlesswar7",e:"⚔️",c:"Action"},{n:"Epic Battle Fantasy 5",f:"clepicbattlefantasy5",e:"⚔️",c:"RPG"},
+  {n:"Escape Road",f:"clescaperoad",e:"🚗",c:"Racing"},{n:"Evil Glitch",f:"clevilglitch",e:"😈",c:"Platformer"},
+  {n:"F-Zero",f:"clfzero",e:"🏎️",c:"Racing"},{n:"Fallout",f:"clfallout",e:"☢️",c:"RPG"},
+  {n:"Fancy Pants Adventure",f:"clfancypantsadventure",e:"👖",c:"Platformer"},{n:"Fancy Pants Adventure 2",f:"clfancypantsadventure2",e:"👖",c:"Platformer"},
+  {n:"Fancy Pants Adventure 3",f:"clfancypantsadventure3",e:"👖",c:"Platformer"},{n:"Feedus",f:"clfeedus",e:"🍖",c:"Strategy"},
+  {n:"Final Fantasy",f:"clfinalfantasy",e:"🗡️",c:"RPG"},{n:"Final Fantasy VI",f:"clfinalfantasyVI",e:"🗡️",c:"RPG"},
+  {n:"Final Fantasy VII",f:"clfinalfantasyVII",e:"🗡️",c:"RPG"},{n:"Final Ninja",f:"clfinalninja",e:"🥷",c:"Action"},
+  {n:"Fire Boy & Water Girl",f:"clfireboyandwatergirl",e:"🔥",c:"Puzzle"},{n:"Fire Boy & Water Girl 2",f:"clfireboyandwatergirl2",e:"💧",c:"Puzzle"},
+  {n:"Fire Boy & Water Girl 3",f:"clfireboyandwatergirl3",e:"🌲",c:"Puzzle"},
+  {n:"FNAF",f:"clFNAF",e:"🐻",c:"Horror"},{n:"FNAF 2",f:"clFNAF2",e:"🐻",c:"Horror"},
+  {n:"FNAF 3",f:"clFNAF3",e:"🐻",c:"Horror"},{n:"FNAF 4",f:"clFNAF4",e:"🐻",c:"Horror"},
+  {n:"FNF",f:"clfridaynightfunkin",e:"🎵",c:"Rhythm"},{n:"FNF Tricky",f:"clfnftricky",e:"🤡",c:"Rhythm"},
+  {n:"FNF Whitty",f:"clfnfwhitty",e:"💣",c:"Rhythm"},{n:"FNF Hex",f:"clfnfhex",e:"🤖",c:"Rhythm"},
+  {n:"FNF Shaggy",f:"clfnfshaggyxmatt",e:"🐕",c:"Rhythm"},{n:"FNF Sonic.EXE",f:"clfnfsonicexe",e:"😈",c:"Rhythm"},
+  {n:"FNF Mid-Fight",f:"clfnfmidfight",e:"🎵",c:"Rhythm"},{n:"FNF Indie Cross",f:"clfnfindiecross",e:"🎮",c:"Rhythm"},
+  {n:"FNF Neo",f:"clfnfneo",e:"🔵",c:"Rhythm"},{n:"FNF Sky",f:"clfnfsky",e:"☁️",c:"Rhythm"},
+  {n:"FNF Soft",f:"clfnfsoft",e:"💕",c:"Rhythm"},{n:"Flood Runner 2",f:"clfloodrunner2",e:"🌊",c:"Action"},
+  {n:"Flood Runner 4",f:"clfloodrunner4",e:"🌊",c:"Action"},{n:"Football Bros",f:"clfootballbros",e:"🏈",c:"Sports"},
+  {n:"Football Legends",f:"clfootballlegends",e:"🏈",c:"Sports"},{n:"Free Rider 2",f:"clfreerider2",e:"🚴",c:"Action"},
+  {n:"Fruit Ninja",f:"clfruitninja",e:"🍉",c:"Action"},{n:"Funny Battle",f:"clfunnybattle",e:"⚔️",c:"Action"},
+  {n:"Galaga",f:"clgalaga",e:"🚀",c:"Shooter"},{n:"Gangsta Bean",f:"clgangstabean",e:"🫘",c:"Action"},
+  {n:"General Chaos",f:"clgeneralchaos",e:"💣",c:"Strategy"},{n:"Geometry Dash Scratch",f:"clgeometrydashscratch",e:"⬛",c:"Platformer"},
+  {n:"Get Away Shootout",f:"clgetawayshootout",e:"🔫",c:"Action"},{n:"Get on Top",f:"clgetontop",e:"🤸",c:"Multiplayer"},
+  {n:"Ghost Trick",f:"clghosttrick",e:"👻",c:"Puzzle"},{n:"Gold Miner",f:"clgoldminer",e:"⛏️",c:"Casual"},
+  {n:"Golden Eye 007",f:"clgoldeneye007",e:"🔫",c:"Shooter"},{n:"Golden Sun",f:"clgoldensun",e:"☀️",c:"RPG"},
+  {n:"Google Baseball",f:"clgooglebaseball",e:"⚾",c:"Sports"},{n:"Google Dino",f:"clgoogledino",e:"🦕",c:"Arcade"},
+  {n:"Grand Theft Auto",f:"clgta",e:"🚗",c:"Action"},{n:"GTA 2",f:"clgta2",e:"🚗",c:"Action"},
+  {n:"Granny",f:"clgranny",e:"👵",c:"Horror"},{n:"Granny 2",f:"clgranny2",e:"👵",c:"Horror"},
+  {n:"Granny 3",f:"clgranny3",e:"👵",c:"Horror"},{n:"Gran Turismo",f:"clgranturismo",e:"🏎️",c:"Racing"},
+  {n:"Gun Blood",f:"clgunblood",e:"🔫",c:"Action"},{n:"Gun Knight",f:"clgunknight",e:"⚔️",c:"Action"},
+  {n:"Gun Mayhem",f:"clgunmayhem",e:"🔫",c:"Action"},{n:"Gun Mayhem 2",f:"clgunmayhem2",e:"🔫",c:"Action"},
+  {n:"Half-Life",f:"clhalflife",e:"🔫",c:"Shooter"},{n:"Halo: Combat Evolved",f:"clhalocombatdevolved",e:"🪖",c:"Shooter"},
+  {n:"Happy Wheels",f:"clhappywheels",e:"🩸",c:"Action"},{n:"Harvest Moon",f:"clharvestmoon",e:"🌾",c:"Simulation"},
+  {n:"Haunted House",f:"clhauntthehouse",e:"👻",c:"Puzzle"},{n:"Helix Jump",f:"clhelixjump",e:"🌀",c:"Casual"},
+  {n:"Hill Climb Racing",f:"clhillclimbracinglite",e:"🚗",c:"Racing"},{n:"Hobo",f:"clhobo",e:"🧑",c:"Action"},
+  {n:"Hobo 2",f:"clhobo2",e:"🧑",c:"Action"},{n:"Hobo 3",f:"clhobo3",e:"🧑",c:"Action"},
+  {n:"Hole.io",f:"clholeio",e:"⚫",c:"Action"},{n:"Hollow Knight",f:"clhollowknight",e:"🦋",c:"Platformer"},
+  {n:"House of Hazards",f:"clhouseofhazards",e:"🏠",c:"Multiplayer"},{n:"Hungry Knight",f:"clhungryknight",e:"⚔️",c:"Action"},
+  {n:"Hyper Sandbox",f:"clhyppersandbox",e:"🏗️",c:"Sandbox"},{n:"Ice Dodo",f:"clicedodo",e:"🧊",c:"Puzzle"},
+  {n:"Idle Breakout",f:"clidlebreakout",e:"🧱",c:"Idle"},{n:"Idle Miner Tycoon",f:"clidleminertycoon",e:"⛏️",c:"Idle"},
+  {n:"Impossible Quiz",f:"climpossiblequiz",e:"❓",c:"Puzzle"},{n:"Impossible Quiz 2",f:"climpossiblequiz2",e:"❓",c:"Puzzle"},
+  {n:"Infinite Craft",f:"clinfinitecraft",e:"🌍",c:"Sandbox"},{n:"Jack Smith",f:"cljacksmith",e:"⚒️",c:"Action"},
+  {n:"Jelly Truck",f:"cljellytruck",e:"🚛",c:"Racing"},{n:"Jet Pack Joyride",f:"cljetpackjoyride",e:"🚀",c:"Action"},
+  {n:"Johnny Trigger",f:"cljohnnytrigger",e:"🔫",c:"Action"},{n:"Johnny Upgrade",f:"cljohnnyupgrade",e:"⬆️",c:"Action"},
+  {n:"Just Fall LOL",f:"cljustfalllol",e:"🍂",c:"Multiplayer"},{n:"Karate Bros",f:"clkaratebros",e:"🥋",c:"Action"},
+  {n:"Kart Bros",f:"clkartbros",e:"🏎️",c:"Racing"},{n:"Killer Instinct",f:"clkillerinstinct",e:"⚔️",c:"Fighting"},
+  {n:"Kingdom Hearts 358/2 Days",f:"clkingdomheartsdays",e:"🔑",c:"RPG"},
+  {n:"Kirby 64",f:"clkirby64",e:"⭐",c:"Platformer"},{n:"Kirby's Adventure",f:"clkirbysadventure",e:"⭐",c:"Platformer"},
+  {n:"Kirby Super Star",f:"clkirbysuperstar",e:"⭐",c:"Platformer"},{n:"Kitten Cannon",f:"clkittencannon",e:"🐱",c:"Casual"},
+  {n:"Knightmare Tower",f:"clknightmaretower",e:"🗼",c:"Action"},{n:"Last Stand",f:"cllaststand",e:"🔫",c:"Action"},
+  {n:"Last Stand 2",f:"cllaststand2",e:"🔫",c:"Action"},{n:"Learn to Fly",f:"cllearntofly",e:"🐧",c:"Action"},
+  {n:"Learn to Fly 2",f:"cllearntofly2",e:"🐧",c:"Action"},{n:"Learn to Fly 3",f:"cllearntofly3",e:"🐧",c:"Action"},
+  {n:"Lego Batman",f:"cllegobatman",e:"🦇",c:"Action"},{n:"Lego Star Wars",f:"cllegostarwars",e:"⭐",c:"Action"},
+  {n:"Level Devil",f:"clleveldevil",e:"😈",c:"Platformer"},{n:"Line Rider",f:"cllinerider",e:"🛷",c:"Sandbox"},
+  {n:"Link to the Past",f:"cllinktothepast",e:"🗡️",c:"RPG"},{n:"Madalin Stunt Cars",f:"clmadalinstuntcars",e:"🚗",c:"Racing"},
+  {n:"Madness Combat",f:"clmadnessinteractive",e:"🩸",c:"Action"},{n:"Madness Retaliation",f:"clmadnessretaliation",e:"🩸",c:"Action"},
+  {n:"Mario 3",f:"clmario3",e:"🍄",c:"Platformer"},{n:"Mario Kart 64",f:"clmariokart64",e:"🏎️",c:"Racing"},
+  {n:"Mario Kart DS",f:"clmariokartds",e:"🏎️",c:"Racing"},{n:"Mario Party",f:"clmarioparty",e:"🎉",c:"Multiplayer"},
+  {n:"Mario Party 2",f:"clmarioparty2",e:"🎉",c:"Multiplayer"},{n:"Mario Party 3",f:"clmarioparty3",e:"🎉",c:"Multiplayer"},
+  {n:"Meat Boy",f:"clmeatboy",e:"🥩",c:"Platformer"},{n:"Medal of Honor",f:"clmedalofhonor",e:"🎖️",c:"Shooter"},
+  {n:"Mega Man",f:"clmegaman",e:"🤖",c:"Platformer"},{n:"Mega Man 2",f:"clmegaman2",e:"🤖",c:"Platformer"},
+  {n:"Mega Man 3",f:"clmegaman3",e:"🤖",c:"Platformer"},{n:"Mega Man X",f:"clmegamanx",e:"🤖",c:"Platformer"},
+  {n:"Mega Man X2",f:"clmegamanx2",e:"🤖",c:"Platformer"},{n:"Mega Man Zero",f:"clmegamanzero",e:"🤖",c:"Platformer"},
+  {n:"Melon Playground",f:"clmelonplayground",e:"🍈",c:"Sandbox"},{n:"Metal Gear Solid",f:"clmetalgearsolid",e:"🐍",c:"Action"},
+  {n:"Metal Slug Advance",f:"clmetalslugadvance",e:"🔫",c:"Action"},{n:"Metroid",f:"clmetroid",e:"🌌",c:"Platformer"},
+  {n:"Metroid Fusion",f:"clmetroidfusion",e:"🌌",c:"Platformer"},{n:"Metroid Zero Mission",f:"clmetroidzeromission",e:"🌌",c:"Platformer"},
+  {n:"Mighty Knight",f:"clmightyknight",e:"⚔️",c:"Action"},{n:"Minecraft 1.8.8",f:"clminecraft1-8-8",e:"⛏️",c:"Sandbox"},
+  {n:"Minesweeper+",f:"clminesweeperplus",e:"💣",c:"Puzzle"},{n:"Monkey Mart",f:"clmonkeymart",e:"🐒",c:"Simulation"},
+  {n:"Mortal Kombat",f:"clmortalkombat",e:"🩸",c:"Fighting"},{n:"Mortal Kombat 2",f:"clmortalkombat2",e:"🩸",c:"Fighting"},
+  {n:"Mortal Kombat 3",f:"clmortalkombat3",e:"🩸",c:"Fighting"},{n:"Mother Load",f:"clmotherload",e:"⛏️",c:"Action"},
+  {n:"Moto X3M",f:"clmotox3mm",e:"🏍️",c:"Racing"},{n:"Moto X3M 2",f:"clmotox3m2",e:"🏍️",c:"Racing"},
+  {n:"Moto X3M 3",f:"clmotox3m3",e:"🏍️",c:"Racing"},{n:"Moto X3M Pool Party",f:"clmotox3mpoolparty",e:"🏊",c:"Racing"},
+  {n:"Moto X3M Spooky Land",f:"clmotox3mspookyland",e:"🎃",c:"Racing"},{n:"Moto X3M Winter",f:"clmotox3mwinter",e:"❄️",c:"Racing"},
+  {n:"Mutilate-a-Doll",f:"clmutilate-a-doll",e:"🪆",c:"Sandbox"},{n:"My Friend Pedro",f:"clmyfriendpedro",e:"🍌",c:"Action"},
+  {n:"Natural Selection",f:"clnaturalselection",e:"🌿",c:"Strategy"},{n:"Neon Blaster",f:"clneonblaster",e:"💫",c:"Shooter"},
+  {n:"Neon Rider",f:"clneonrider",e:"🏍️",c:"Racing"},{n:"New Grounds Rumble",f:"clnewgroundsrumble",e:"👊",c:"Fighting"},
+  {n:"New Super Mario Bros",f:"clnewsupermariobros",e:"🍄",c:"Platformer"},{n:"NFS Most Wanted",f:"clnfsmostwanted",e:"🚗",c:"Racing"},
+  {n:"NFS Underground",f:"clnfsunderground",e:"🚗",c:"Racing"},{n:"NFS Underground 2",f:"clnfsunderground2",e:"🚗",c:"Racing"},
+  {n:"Nitrome Must Die",f:"clnitromemustdie",e:"💀",c:"Action"},{n:"N+",f:"clnplus",e:"🟡",c:"Platformer"},
+  {n:"Only Up",f:"clonlyup",e:"⬆️",c:"Platformer"},{n:"Oregon Trail",f:"cloregontrail",e:"🌵",c:"Simulation"},
+  {n:"OvO",f:"clovo",e:"🏃",c:"Platformer"},{n:"OvO 2",f:"clovo2",e:"🏃",c:"Platformer"},
+  {n:"OvO Dimensions",f:"clovodimensions",e:"🏃",c:"Platformer"},{n:"Pac-Man",f:"clpacman",e:"👾",c:"Arcade"},
+  {n:"Papa Louie: When Burgers Attack",f:"clpapalouiewhenburgersattack",e:"🍔",c:"Platformer"},
+  {n:"Papa's Bakeria",f:"clpapabakeria",e:"🧁",c:"Simulation"},{n:"Papa's Cheeseria",f:"clpapascheeseria",e:"🧀",c:"Simulation"},
+  {n:"Papa's Cupcakeria",f:"clpapascupcakeria",e:"🧁",c:"Simulation"},{n:"Papa's Freezeria",f:"clpapasfreezeria",e:"🍦",c:"Simulation"},
+  {n:"Papa's Hot Doggeria",f:"clpapashotdoggeria",e:"🌭",c:"Simulation"},{n:"Papa's Pancakeria",f:"clpapaspancakeria",e:"🥞",c:"Simulation"},
+  {n:"Papa's Pastaria",f:"clpapaspastaria",e:"🍝",c:"Simulation"},{n:"Papa's Scooperia",f:"clpapasscooperia",e:"🍨",c:"Simulation"},
+  {n:"Papa's Sushiria",f:"clpapassushiria",e:"🍣",c:"Simulation"},{n:"Paper.io",f:"clpaperio",e:"📄",c:"Multiplayer"},
+  {n:"Paper Mario",f:"clpapermario",e:"📄",c:"RPG"},{n:"Paper Mario TTYD",f:"clpapermariottyd",e:"📄",c:"RPG"},
+  {n:"Parking Fury",f:"clparkingfury",e:"🚗",c:"Puzzle"},{n:"Parking Fury 2",f:"clparkingfury2",e:"🚗",c:"Puzzle"},
+  {n:"Peggle",f:"clpeggle",e:"🟠",c:"Puzzle"},{n:"Penguin Diner",f:"clpenguindiner",e:"🐧",c:"Simulation"},
+  {n:"Perfect Dark",f:"clperfectdark",e:"🔫",c:"Shooter"},{n:"Persona",f:"clpersona",e:"🃏",c:"RPG"},
+  {n:"Pizza Tower",f:"clpizzatower",e:"🍕",c:"Platformer"},{n:"Plants vs Zombies",f:"clplantsvszombies",e:"🌻",c:"Strategy"},
+  {n:"Plants vs Zombies 2",f:"clpvz2",e:"🌻",c:"Strategy"},{n:"Plazma Burst",f:"clplazmaburst",e:"🔫",c:"Shooter"},
+  {n:"Polytrack",f:"polytrackbutnotflagged",e:"🏎️",c:"Racing"},
+  {n:"Pokemon Black",f:"clpokeblack",e:"⬛",c:"RPG"},{n:"Pokemon Blue",f:"clpokeblue",e:"💙",c:"RPG"},
+  {n:"Pokemon Crystal",f:"clpokemoncrystal",e:"💎",c:"RPG"},{n:"Pokemon Diamond",f:"clpokediamond",e:"💠",c:"RPG"},
+  {n:"Pokemon Emerald",f:"clpokemonemerald",e:"💚",c:"RPG"},{n:"Pokemon FireRed",f:"clpokemonfirered",e:"🔴",c:"RPG"},
+  {n:"Pokemon Gold",f:"clpokemongold",e:"🟡",c:"RPG"},{n:"Pokemon HeartGold",f:"clpokeheartgold",e:"💛",c:"RPG"},
+  {n:"Pokemon Platinum",f:"clpokeplatinum",e:"⚪",c:"RPG"},{n:"Pokemon Red",f:"clpokered",e:"🔴",c:"RPG"},
+  {n:"Pokemon Ruby",f:"clpokemonruby",e:"🔴",c:"RPG"},{n:"Pokemon Sapphire",f:"clpokemonsapphire",e:"💙",c:"RPG"},
+  {n:"Pokemon Silver",f:"clpokemonsilver",e:"⚪",c:"RPG"},{n:"Pokemon SoulSilver",f:"clpokesoulsilver",e:"🥈",c:"RPG"},
+  {n:"Pokemon Tower Defense",f:"clpokemontowerdefense",e:"🗼",c:"Strategy"},{n:"Pokemon White",f:"clpokewhite",e:"⬜",c:"RPG"},
+  {n:"Pokemon Yellow",f:"clpokeyellow",e:"💛",c:"RPG"},{n:"Pokemon Mystery Dungeon",f:"clpokemonmysterydungeon",e:"🌀",c:"RPG"},
+  {n:"Pokemon Quetzal",f:"clpokemonquetzal",e:"🦜",c:"RPG"},{n:"Pokemon Radical Red",f:"clradicalred",e:"🔴",c:"RPG"},
+  {n:"Pokemon Unbound",f:"clpokemonunbound",e:"⛓️",c:"RPG"},{n:"Pokemon Clover",f:"clpokemonclover",e:"🍀",c:"RPG"},
+  {n:"Portal 2D",f:"clportal2d",e:"🟠",c:"Puzzle"},{n:"Portal Flash",f:"clportalflash",e:"🟠",c:"Puzzle"},
+  {n:"Punch-Out!!",f:"clpunchout",e:"🥊",c:"Sports"},{n:"Puyo Puyo Fever",f:"clpuyopuyofever",e:"🫧",c:"Puzzle"},
+  {n:"QWOP",f:"clqwop",e:"🏃",c:"Casual"},{n:"Quake 2",f:"clquake2",e:"🔫",c:"Shooter"},
+  {n:"Quake 3",f:"clquake3",e:"🔫",c:"Shooter"},{n:"Raft Wars",f:"clraftwars",e:"🛟",c:"Strategy"},
+  {n:"Raft Wars 2",f:"clraftwars2",e:"🛟",c:"Strategy"},{n:"Ragdoll Archers",f:"clragdollarchers",e:"🏹",c:"Action"},
+  {n:"Ragdoll Hit",f:"clragdollhit",e:"👊",c:"Action"},{n:"Raze",f:"clraze",e:"🔫",c:"Shooter"},
+  {n:"Raze 2",f:"clraze2",e:"🔫",c:"Shooter"},{n:"Raze 3",f:"clraze3",e:"🔫",c:"Shooter"},
+  {n:"Rebuild",f:"clrebuild",e:"🏗️",c:"Strategy"},{n:"Rebuild 2",f:"clrebuild2",e:"🏗️",c:"Strategy"},
+  {n:"Red Ball 4",f:"clredball4",e:"🔴",c:"Platformer"},{n:"Resident Evil",f:"clresidentevil",e:"🧟",c:"Horror"},
+  {n:"Resident Evil 2",f:"clresidentevil2",e:"🧟",c:"Horror"},{n:"Retro Bowl",f:"clretrobowl",e:"🏈",c:"Sports"},
+  {n:"Retro Bowl College",f:"clretrobowlcollege",e:"🏈",c:"Sports"},{n:"Return Man",f:"clreturnman",e:"🏈",c:"Sports"},
+  {n:"Return to Riddle School",f:"clreturntoriddleschool",e:"🏫",c:"Puzzle"},{n:"Revolution Idle",f:"clrevolutionidle",e:"⚙️",c:"Idle"},
+  {n:"Rhythm Heaven",f:"clrhythmheaven",e:"🥁",c:"Rhythm"},{n:"Riddle School",f:"clriddleschool",e:"🏫",c:"Puzzle"},
+  {n:"Riddle Transfer",f:"clriddletransfer",e:"🏫",c:"Puzzle"},{n:"Road of the Dead",f:"clroadofthedead",e:"🧟",c:"Action"},
+  {n:"Road of the Dead 2",f:"clroadofthedead2",e:"🧟",c:"Action"},{n:"Rocket Knight Adventures",f:"clrocketknightadventures",e:"🚀",c:"Platformer"},
+  {n:"Rocket League",f:"clrocketleague",e:"🚀",c:"Sports"},{n:"Rogue Soul",f:"clroguesoul",e:"⚔️",c:"Platformer"},
+  {n:"Rogue Soul 2",f:"clroguesoul2",e:"⚔️",c:"Platformer"},{n:"Rolling Sky",f:"clrollingsky",e:"🌀",c:"Casual"},
+  {n:"Rooftop Snipers",f:"clrooftopsnipers",e:"🎯",c:"Action"},{n:"Rooftop Snipers 2",f:"clrooftopsnipers2",e:"🎯",c:"Action"},
+  {n:"Run",f:"clrun",e:"🏃",c:"Platformer"},{n:"Run 2",f:"clrun2",e:"🏃",c:"Platformer"},
+  {n:"Run 3",f:"clrun3",e:"🏃",c:"Platformer"},{n:"Sandbox City",f:"clsandboxcity",e:"🏙️",c:"Sandbox"},
+  {n:"Scary Maze Game",f:"clscarymazegame",e:"😱",c:"Horror"},{n:"Scribblenauts",f:"clscribblenauts",e:"✏️",c:"Puzzle"},
+  {n:"Secret of Mana",f:"clsecretofmana",e:"🌿",c:"RPG"},{n:"Shift",f:"clshift",e:"⬛",c:"Platformer"},
+  {n:"Short Life",f:"clshortlife",e:"💀",c:"Action"},{n:"Sierra 7",f:"clsierra7",e:"🎖️",c:"Shooter"},
+  {n:"Silent Hill",f:"clsilenthill",e:"🌫️",c:"Horror"},{n:"Six Ways to Die",f:"clsixwaystodie",e:"💀",c:"Action"},
+  {n:"Skate It",f:"clskateit",e:"🛹",c:"Sports"},{n:"Slime Laboratory",f:"clslimelabratory",e:"🟢",c:"Platformer"},
+  {n:"Slipways",f:"clslipways",e:"🌌",c:"Strategy"},{n:"Slither.io",f:"clslitherio",e:"🐍",c:"Multiplayer"},
+  {n:"Slope",f:"clslope",e:"⛷️",c:"Action"},{n:"Slope 3",f:"clslope3",e:"⛷️",c:"Action"},
+  {n:"Slow Roads",f:"clslowroads",e:"🚗",c:"Racing"},{n:"Smash Karts",f:"clsmashkarts",e:"🏎️",c:"Racing"},
+  {n:"Snail Bob",f:"clsnailbob",e:"🐌",c:"Puzzle"},{n:"Snail Bob 2",f:"clsnailbob2",e:"🐌",c:"Puzzle"},
+  {n:"Snow Rider",f:"clsnowrider",e:"🎿",c:"Racing"},{n:"Soccer Bros",f:"clsoccerbros",e:"⚽",c:"Sports"},
+  {n:"Soccer Random",f:"clsoccerrandom",e:"⚽",c:"Sports"},{n:"Solar Smash",f:"clsolarsmash",e:"💥",c:"Sandbox"},
+  {n:"Solitaire",f:"clsolitaire",e:"🃏",c:"Card"},{n:"Sonic 1",f:"clsonicthehedgehog",e:"💨",c:"Platformer"},
+  {n:"Sonic 2",f:"clsonicthehedgehog2",e:"💨",c:"Platformer"},{n:"Sonic 3",f:"clsonicthehedgehog3",e:"💨",c:"Platformer"},
+  {n:"Sonic 3 & Knuckles",f:"clsonic3andknuckles",e:"💨",c:"Platformer"},{n:"Sonic Advance",f:"clsonicadvance",e:"💨",c:"Platformer"},
+  {n:"Sonic CD",f:"clsoniccd",e:"💨",c:"Platformer"},{n:"Sonic Classic Heroes",f:"clsonicclassicheroes",e:"💨",c:"Platformer"},
+  {n:"Sonic Rush",f:"clsonicrush",e:"💨",c:"Platformer"},{n:"Spewer",f:"clspewer",e:"🟢",c:"Puzzle"},
+  {n:"Sprunki / Incredibox",f:"clsprunki",e:"🎵",c:"Music"},{n:"Star Fox",f:"clstarfox",e:"🦊",c:"Shooter"},
+  {n:"Star Fox 64",f:"clstarfox64",e:"🦊",c:"Shooter"},{n:"Stateio",f:"clstateio",e:"🗺️",c:"Strategy"},
+  {n:"Stealth Assassin",f:"clstealthassassin",e:"🥷",c:"Action"},{n:"Stick Archer Battle",f:"clstickarchersbattle",e:"🏹",c:"Action"},
+  {n:"Stickman Hook",f:"clstickmanhook",e:"🪝",c:"Platformer"},{n:"Stick RPG",f:"clstickrpgcomplete",e:"🎮",c:"RPG"},
+  {n:"Stick War",f:"clstickwar",e:"⚔️",c:"Strategy"},{n:"Stick War 2",f:"clstickwar2",e:"⚔️",c:"Strategy"},
+  {n:"Storm the House",f:"clstormthehouse",e:"🏠",c:"Strategy"},{n:"Storm the House 3",f:"clstormthehouse3",e:"🏠",c:"Strategy"},
+  {n:"Street Fighter 2",f:"clstreetfighter2",e:"👊",c:"Fighting"},{n:"Street Fighter Alpha 3",f:"clstreetfighteralpha3",e:"👊",c:"Fighting"},
+  {n:"Streets of Rage",f:"clstreetofrage",e:"👊",c:"Action"},{n:"Streets of Rage 2",f:"clstreetofrage2",e:"👊",c:"Action"},
+  {n:"Strike Force Heroes",f:"clstrikeforceheroes",e:"🔫",c:"Action"},{n:"Strike Force Heroes 2",f:"clstrikeforceheroes2",e:"🔫",c:"Action"},
+  {n:"Strike Force Heroes 3",f:"clstrikeforceheroes3",e:"🔫",c:"Action"},
+  {n:"Subway Surfers London",f:"clsubwaysurferslondon",e:"🚇",c:"Action"},{n:"Subway Surfers Miami",f:"clsubwaysurfersmiami",e:"🚇",c:"Action"},
+  {n:"Sugar Sugar",f:"clsugarsugar",e:"🍬",c:"Puzzle"},{n:"Suika Game",f:"clsuika",e:"🍉",c:"Puzzle"},
+  {n:"Super Bomberman",f:"clsuperbomberman",e:"💣",c:"Action"},{n:"Super Cold",f:"clsupercold",e:"❄️",c:"Action"},
+  {n:"Super Fighters",f:"clsuperfighters",e:"👊",c:"Fighting"},{n:"Super Hot",f:"clsuperhot",e:"🔥",c:"Action"},
+  {n:"Super Mario 63",f:"clsupermario63",e:"🍄",c:"Platformer"},{n:"Super Mario 64",f:"clsupermario64",e:"🍄",c:"Platformer"},
+  {n:"Super Mario Bros",f:"clsupermariobros",e:"🍄",c:"Platformer"},{n:"Super Mario Bros 3",f:"clsupermariobros3",e:"🍄",c:"Platformer"},
+  {n:"Super Mario Kart",f:"clsupermariokart",e:"🏎️",c:"Racing"},{n:"Super Mario RPG",f:"clsupermariorpg",e:"🍄",c:"RPG"},
+  {n:"Super Mario World",f:"clsupermarioworld",e:"🍄",c:"Platformer"},{n:"Super Metroid",f:"clsupermetroid",e:"🌌",c:"Platformer"},
+  {n:"Super Punch-Out!!",f:"clsuperpunchout",e:"🥊",c:"Sports"},{n:"Super Smash Bros",f:"clsupersmashbros",e:"🥊",c:"Fighting"},
+  {n:"Super Smash Flash",f:"clsupersmashflash",e:"🥊",c:"Fighting"},{n:"Super Smash Flash 2",f:"clsupersmashflash2",e:"🥊",c:"Fighting"},
+  {n:"Supreme Duelist",f:"clsupremeduelist",e:"⚔️",c:"Action"},{n:"Sushi Cat",f:"clsushicat",e:"🐱",c:"Casual"},
+  {n:"Swords and Sandals",f:"clswordsandsandals",e:"⚔️",c:"RPG"},{n:"Swords and Sandals 2",f:"clswordsandsandals2",e:"⚔️",c:"RPG"},
+  {n:"Swords and Souls",f:"clswordsandsouls",e:"⚔️",c:"RPG"},{n:"Table Tennis World Tour",f:"cltabletennisworldtour",e:"🏓",c:"Sports"},
+  {n:"Takeover",f:"cltakeover",e:"🏰",c:"Strategy"},{n:"Tank Mayhem",f:"cltankmayhem",e:"🪖",c:"Action"},
+  {n:"Tasty Planet",f:"cltastyplanet",e:"🌍",c:"Action"},{n:"Temple of Boom",f:"cltempleofboom",e:"💣",c:"Action"},
+  {n:"Temple Run 2",f:"cltemplerun2",e:"🏃",c:"Action"},{n:"Territorial.io",f:"clterritorialio",e:"🗺️",c:"Strategy"},
+  {n:"Territory War",f:"clterritorywar",e:"⚔️",c:"Strategy"},{n:"Tetris",f:"cltetris",e:"🧩",c:"Puzzle"},
+  {n:"The Classroom",f:"cltheclassroom",e:"🏫",c:"Puzzle"},{n:"The Classroom 2",f:"cltheclassroom2",e:"🏫",c:"Puzzle"},
+  {n:"The Classroom 3",f:"cltheclassroom3",e:"🏫",c:"Puzzle"},{n:"The Impossible Game",f:"cltheimpossiblegame",e:"⬛",c:"Platformer"},
+  {n:"The Last Stand Union City",f:"clthelaststandunioncity",e:"🧟",c:"Action"},
+  {n:"This Is The Only Level",f:"clthisistheonlylevel",e:"🐘",c:"Puzzle"},{n:"This Is The Only Level 2",f:"clthisistheonlylevel2",e:"🐘",c:"Puzzle"},
+  {n:"Time Shooter 2",f:"cltimeshooter2",e:"⏱️",c:"Action"},{n:"Time Shooter 3",f:"cltimeshooter3",e:"⏱️",c:"Action"},
+  {n:"Tiny Fishing",f:"cltinyfishing",e:"🎣",c:"Casual"},{n:"Toss the Turtle",f:"cltosstheturtle",e:"🐢",c:"Action"},
+  {n:"Tower Blocks",f:"cltowerblocks",e:"🗼",c:"Casual"},{n:"Trace",f:"cltrace",e:"🔍",c:"Puzzle"},
+  {n:"Troll Face Quest",f:"cltrollfacequest1",e:"😏",c:"Puzzle"},{n:"Troll Face Quest 2",f:"cltrollfacequest2",e:"😏",c:"Puzzle"},
+  {n:"Tunnel Rush",f:"cltunnelrush",e:"🌀",c:"Action"},{n:"Turbo Stars",f:"clturbostars",e:"⭐",c:"Racing"},
+  {n:"Twisted Metal",f:"cltwistedmetal",e:"🚗",c:"Racing"},{n:"Two Ball 3D",f:"cltwoball3d",e:"⚽",c:"Sports"},
+  {n:"Undertale",f:"clundertaler",e:"❤️",c:"RPG"},{n:"Undertale Yellow",f:"clundertaleyellow",e:"💛",c:"RPG"},
+  {n:"Unfair Mario",f:"clunfairmario",e:"😠",c:"Platformer"},{n:"Uno",f:"cluno",e:"🃏",c:"Card"},
+  {n:"Upgrade Complete",f:"clupgradecomplete",e:"⬆️",c:"Action"},{n:"Upgrade Complete 2",f:"clupgradecomplete2",e:"⬆️",c:"Action"},
+  {n:"Vampire Survivors",f:"clvampiresurvivors",e:"🧛",c:"Action"},{n:"Vex",f:"clvex",e:"🏃",c:"Platformer"},
+  {n:"Vex 2",f:"clvex2",e:"🏃",c:"Platformer"},{n:"Vex 3",f:"clvex3",e:"🏃",c:"Platformer"},
+  {n:"Vex 4",f:"clvex4",e:"🏃",c:"Platformer"},{n:"Vex 5",f:"clvex5",e:"🏃",c:"Platformer"},
+  {n:"Vex 6",f:"clvex6",e:"🏃",c:"Platformer"},{n:"Vex 7",f:"clvex7",e:"🏃",c:"Platformer"},
+  {n:"Vex 8",f:"clvex8",e:"🏃",c:"Platformer"},{n:"VVVVVV",f:"clvvvvvv",e:"⬆️",c:"Platformer"},
+  {n:"Warfare 1944",f:"clwarfare1944",e:"⚔️",c:"Strategy"},{n:"Wario Land 4",f:"clwarioland4",e:"🟡",c:"Platformer"},
+  {n:"WarioWare Inc.",f:"clwariowareinc",e:"🕹️",c:"Casual"},{n:"Wave Run",f:"clwaverun",e:"🌊",c:"Action"},
+  {n:"Whack Your Boss",f:"clwhackyourboss",e:"💢",c:"Action"},{n:"Wheely",f:"clwheely",e:"🚗",c:"Puzzle"},
+  {n:"Wheely 2",f:"clwheely2",e:"🚗",c:"Puzzle"},{n:"Wolfenstein 3D",f:"clwolfenstein3d",e:"🔫",c:"Shooter"},
+  {n:"Wordle",f:"clwordle",e:"📝",c:"Puzzle"},{n:"World's Hardest Game",f:"clworldshardestgame",e:"😤",c:"Platformer"},
+  {n:"World's Hardest Game 2",f:"clworldshardestgame2",e:"😤",c:"Platformer"},{n:"World's Hardest Game 3",f:"clworldshardestgame3",e:"😤",c:"Platformer"},
+  {n:"Wrassling",f:"clwrassling",e:"🤼",c:"Sports"},{n:"Wrestle Bros",f:"clwrestlebros",e:"🤼",c:"Sports"},
+  {n:"Yandere Simulator",f:"clyanderesimulator",e:"😊",c:"Simulation"},{n:"Zelda: Minish Cap",f:"clzeldaminishcap",e:"🗡️",c:"RPG"},
+  {n:"Zelda: Link's Awakening",f:"cllozlinkawakening",e:"🗡️",c:"RPG"},{n:"Zenword",f:"clzenword",e:"📝",c:"Puzzle"},
+  {n:"Zombie Rush",f:"clzombierush",e:"🧟",c:"Action"},{n:"Zombotron",f:"clzombotron",e:"🤖",c:"Action"},
+  {n:"Zombotron 2",f:"clzombotron2",e:"🤖",c:"Action"},{n:"Zuma",f:"clzuma",e:"🐸",c:"Puzzle"},
+  {n:"EaglercraftX 1.8.8",f:"EaglercraftX 1.8.8(u29)",e:"⛏️",c:"Sandbox"},{n:"Eaglercraft Beta 1.3",f:"Eaglercraft-Beta-1.3-Offline",e:"⛏️",c:"Sandbox"},
+  {n:"Eaglercraft 1.5.2",f:"eaglercraft.1.5.2",e:"⛏️",c:"Sandbox"},{n:"Marble Racer",f:"marbleracer",e:"🔮",c:"Racing"},
+  {n:"Mario Builder 64",f:"mariobuilder64",e:"🍄",c:"Platformer"},{n:"Mortal Kombat 4",f:"mortalkombat4",e:"🩸",c:"Fighting"},
+  {n:"Sandstone",f:"sandstone",e:"🟨",c:"Sandbox"},{n:"Snow Bros",f:"snowbros",e:"❄️",c:"Action"},
+  {n:"Rocket Knight 2",f:"rocketknight2",e:"🚀",c:"Platformer"},];
+const FONTS=[  {n:'Space Grotesk', css:"'Space Grotesk', sans-serif"},
+  {n:'Poppins',       css:"'Poppins', sans-serif"},
+  {n:'Helvetica',     css:"Helvetica, Arial, sans-serif"},
+  {n:'Verdana',       css:"Verdana, Geneva, sans-serif"},
+  {n:'Garamond',      css:"Garamond, 'Times New Roman', serif"},
+  {n:'Futura',        css:"Futura, 'Century Gothic', 'Trebuchet MS', sans-serif"},
+  {n:'SF Pro',        css:"-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', sans-serif"},];
+const HELP=[  {i:'🔍',t:'Search',b:'Type in the search bar to filter games instantly. Results update live as you type, with autocomplete suggestions and a "Did you mean?" correction system for misspellings.'},
+  {i:'⭐',t:'Favorites',b:'Click the ❤️ on any game card to favorite it. Favorited games pin to the top of the home screen. Go to the Favorites tab to see them all.'},
+  {i:'🔄',t:'Sorting',b:'Use the Sort dropdown to organize games: A→Z, Z→A, Recently Added, Most Played, or Favorites First. Your sort preference is saved automatically.'},
+  {i:'⚡',t:'Performance Mode',b:'Open Settings and set Performance to Low or Medium to reduce blur, animations, and particle effects — best for Chromebooks, older laptops, and Android devices.'},
+  {i:'🎨',t:'Themes & Colors',b:'Settings lets you switch between Dark and Light mode, customize the accent color with HSL sliders, and set a custom background color or upload a wallpaper.'},
+  {i:'🖼️',t:'Wallpaper',b:'In the More menu, use Wallpaper Manager to paste an image URL or upload a local file. Click Remove Wallpaper to return to the default background color.'},
+  {i:'⚙️',t:'Settings',b:'The gear icon opens Settings where you can control everything: theme, accent color, background color, font, layout, performance, effects, and play screen customization. All settings auto-save.'},];
+const CDN='https://cdn.jsdelivr.net/gh/bubbls/ugs-singlefile/UGS-Files/';
+const K={st:'blz2_st',favs:'blz2_favs',rec:'blz2_rec',played:'blz2_played'};
+const ACCENTS=[[220,90,68],[270,80,65],[330,90,62],[15,90,62],[45,95,58],[145,70,50],[185,80,52],[0,85,60],[290,70,60]];
+const BGD=['#0d0f1a','#0f1c2e','#120d1a','#0d1a12','#1a0d0d','#1a1a0d','#0a0a0a','#16161e'];
+const BGL=['#f0f2fa','#e8f4ff','#f5e8ff','#e8fff0','#fff0e8','#fffff0','#f8f8f8','#e8eaf0'];
+const SORTS=[['default','Default'],['az','A → Z'],['za','Z → A'],['recent','Recently Added'],['played','Most Played'],['favfirst','Favorites First']];
+const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
+const ld=(k,d)=>{try{return JSON.parse(localStorage.getItem(k))??d}catch{return d}};
+const lowEnd=(navigator.deviceMemory||8)<=4||matchMedia('(prefers-reduced-motion:reduce)').matches;
+const D={theme:'dark',hue:220,sat:90,bri:68,font:'Space Grotesk',layout:'comfy',perf:lowEnd?'med':'high',snow:true,steam:true,recents:true,playNow:true,debug:false,cats:false,anim:true,sort:'default',playLabel:'PLAY NOW',playColor:'#1a1a1a',playDesc:'',bg:'',wall:''};
+let ST={...D,...ld(K.st,{})},FAVS=ld(K.favs,[]),REC=ld(K.rec,[]),PLAYED=ld(K.played,{}),sec='home',q='',cur=null,tm;
+if(ST.bgColor&&!ST.bg)ST.bg=ST.bgColor;delete ST.bgColor;
+const byF=f=>DB.find(g=>g.f===f);
+function save(){try{localStorage.setItem(K.st,JSON.stringify(ST));localStorage.setItem(K.favs,JSON.stringify(FAVS));localStorage.setItem(K.rec,JSON.stringify(REC));localStorage.setItem(K.played,JSON.stringify(PLAYED));return true}catch{toast('Could not save (storage full)','err');return false}}
+function toast(m,err){const t=document.createElement('div');t.className='toast'+(err?' err':'');t.textContent=m;document.body.appendChild(t);setTimeout(()=>t.remove(),2600)}
+const hsl2rgb=(h,s,l)=>{s/=100;l/=100;const k=n=>(n+h/30)%12,a=s*Math.min(l,1-l),f=n=>Math.round(255*(l-a*Math.max(-1,Math.min(k(n)-3,9-k(n),1))));return`${f(0)},${f(8)},${f(4)}`};
+
+/* ---------- settings ---------- */
+function set(k,v){
+  ST[k]=v;if(k==='theme'){ST.bg='';bgDots()}
+  save();apply();if(['sort','cats','anim','recents'].includes(k))render();
 }
-function originOk(req) {
-  const o = req.headers.origin; if (!o) return true;
-  try { return new URL(o).host === req.headers.host || ORIGINS.includes(o); } catch { return false; }
+function apply(){
+  const h=document.documentElement,r=h.style;
+  h.dataset.theme=ST.theme;h.dataset.perf=ST.perf;h.dataset.layout=ST.layout;
+  r.setProperty('--ac',`hsl(${ST.hue},${ST.sat}%,${ST.bri}%)`);r.setProperty('--acrgb',hsl2rgb(ST.hue,ST.sat,ST.bri));
+  r.setProperty('--font',(FONTS.find(f=>f.n===ST.font)||FONTS[0]).css);
+  ST.bg?r.setProperty('--bg',ST.bg):r.removeProperty('--bg');
+  $('#wall').style.cssText=ST.wall?`background-image:url("${ST.wall.replace(/"/g,'%22')}");opacity:1`:'';
+  $('#snow').style.opacity=ST.snow?'':'0';$('#steam').style.opacity=ST.steam?'':'0';
+  $('#dbg').classList.toggle('hidden',!ST.debug);
+  $$('[data-k]').forEach(e=>{if(e.type==='checkbox')e.checked=!!ST[e.dataset.k]});
+  $$('[data-set]').forEach(e=>{const[k,v]=e.dataset.set.split(':');e.classList.toggle('on',String(ST[k])===v)});
+  const ps=$('#psec');if(ps){ps.style.opacity=ST.playNow?1:.4;const p=$('#pp');p.textContent='▶ '+(ST.playLabel||'PLAY NOW');p.style.background=ST.playColor}
 }
-const hits = new Map();
-function limited(key, max, ms) { const n = Date.now(), a = (hits.get(key) || []).filter(t => n - t < ms); a.push(n); hits.set(key, a); return a.length > max; }
-setInterval(() => { const n = Date.now(); for (const [k, a] of hits) if (!a.some(t => n - t < 3600e3)) hits.delete(k); }, 600e3);
-// Cookie is HttpOnly (JS can't read it). In production it is Secure + SameSite=None + Partitioned so it still
-// works when the site is embedded in an iframe (e.g. Google Sites); the Origin check above replaces SameSite as CSRF defence.
-const ck = (tok, age) => `nix_sid=${tok}; Path=/; HttpOnly; Max-Age=${age}` + (PROD ? '; Secure; SameSite=None; Partitioned' : '; SameSite=Lax');
-function readJSON(req) {
-  return new Promise((ok, no) => { let b = ''; req.on('data', d => { b += d; if (b.length > 2048) { no(new Error('big')); req.destroy(); } }); req.on('end', () => { try { ok(JSON.parse(b || '{}')); } catch { no(new Error('bad json')); } }); });
-}
-async function check(u, pw) {
-  const h = await scrypt(String(pw), u ? u.salt : '0'.repeat(32), 64);
-  return !!u && crypto.timingSafeEqual(h, Buffer.from(u.h, 'hex'));
+const S=(t,b)=>`<div class="sec"><div class="st">${t}</div>${b}</div>`;
+const tg=(k,t,d)=>`<label class="tog"><span>${t}<small>${d}</small></span><input type="checkbox" data-k="${k}"></label>`;
+const sb=(k,v,t,st='')=>`<button class="btn" data-set="${k}:${v}" style="${st}">${t}</button>`;
+const DATA='<div class="row"><button class="btn" data-act="export">⬇ Export</button><button class="btn" data-act="import">⬆ Import</button></div>';
+function bgDots(){const b=$('#bgdots');if(b)b.replaceChildren(...(ST.theme==='light'?BGL:BGD).map(c=>{const d=document.createElement('button');d.className='dot';d.style.background=c;d.dataset.bg=c;d.title=c;return d}))}
+function buildSettings(){
+  $('#setdd').innerHTML=
+   S('Theme',`<div class="row">${sb('theme','dark','🌙 Dark')}${sb('theme','light','☀️ Light')}</div>`)+
+   S('UI Accent Color',['hue:HUE:0:360','sat:SATURATION:0:100','bri:BRIGHTNESS:20:100'].map(s=>{const[k,l,a,b]=s.split(':');return`<div class="lb">${l}</div><input type="range" data-r="${k}" min="${a}" max="${b}" value="${ST[k]}">`}).join('')+`<div class="dots">${ACCENTS.map(a=>`<button class="dot" data-ac="${a}" style="background:hsl(${a[0]},${a[1]}%,${a[2]}%)"></button>`).join('')}</div>`)+
+   S('Background Color',`<div class="dots" id="bgdots" style="margin:0 0 8px"></div><div class="row"><input class="inp" id="bgc" placeholder="#0d0f1a or rgb(...)" style="margin:0"><button class="btn" style="flex:none" data-act="bgapply">Apply</button></div>`)+
+   S('Font',`<div class="fonts">${FONTS.map(f=>sb('font',f.n,f.n,`font-family:${f.css.replace(/"/g,"'")}`)).join('')}</div>`)+
+   S('Layout',`<div class="row">${sb('layout','comfy','Comfy')}${sb('layout','compact','Compact')}</div>`)+
+   S('Performance Mode',`<p class="cl">Optimized for Chromebooks &amp; low-end devices</p><div class="row">${sb('perf','low','LOW')}${sb('perf','med','MED')}${sb('perf','high','HIGH')}</div>`)+
+   S('Options',tg('snow','Snow Effect','Falling snow animation')+tg('steam','Steam Effect','Particles that rise upwards')+tg('recents','Show Recents','Display recently played games')+tg('playNow','Play Now Screen','Show a screen before launching a game'))+
+   `<div class="sec" id="psec"><div class="st">Customize Play Screen</div><div class="play" id="pp"></div><div class="lb">BUTTON LABEL</div><input class="inp" data-t="playLabel" value="${ST.playLabel.replace(/"/g,'&quot;')}"><div class="lb">BUTTON COLOR</div><input class="inp" data-t="playColor" value="${ST.playColor}"><div class="lb">DESCRIPTION TEXT</div><input class="inp" data-t="playDesc" value="${ST.playDesc.replace(/"/g,'&quot;')}"></div>`+
+   S('Import / Export Settings',DATA)+S('Reset','<button class="btn danger" style="width:100%" data-act="reset">Reset All Settings</button>');
+  $('#sortdd').innerHTML=SORTS.map(([k,l])=>`<button class="opt" data-set="sort:${k}">${l}</button>`).join('');
+  bgDots();
 }
 
-/* ---------- HTTP ---------- */
-const server = http.createServer(async (req, res) => {
-  const send = (c, o, h = {}) => { res.writeHead(c, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...h }); res.end(JSON.stringify(o)); };
-  try {
-    const url = req.url.split('?')[0], me = ip(req);
-    if (req.method === 'GET' && (url === '/' || url === '/index.html')) {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Content-Type-Options': 'nosniff' });
-      return res.end(fs.readFileSync(path.join(__dirname, 'public', 'index.html')));
-    }
-    if (!url.startsWith('/api/')) return send(404, { error: 'Not found' });
-    if (req.method === 'GET' && url === '/api/me') { const u = sessionUser(req); return send(200, { user: u ? pub(u) : null }); }
-    if (req.method !== 'POST') return send(405, { error: 'Method not allowed' });
-    if (!originOk(req)) return send(403, { error: 'Bad origin' });
-    const b = await readJSON(req), start = (k, u) => {
-      const tok = crypto.randomBytes(32).toString('hex');
-      for (const [h, s] of Object.entries(DB.sessions)) if (s.exp < Date.now()) delete DB.sessions[h];
-      DB.sessions[sha(tok)] = { u: k, exp: Date.now() + 30 * 864e5 }; touch();
-      send(200, { user: pub(u) }, { 'Set-Cookie': ck(tok, 30 * 86400) });
-    };
-    if (url === '/api/signup') {
-      if (limited('su' + me, 5, 3600e3)) return send(429, { error: 'Too many sign-ups from this network. Try again later.' });
-      const name = String(b.username || ''), pw = String(b.password || ''), k = name.toLowerCase();
-      if (!/^[A-Za-z0-9_]{3,16}$/.test(name)) return send(400, { error: 'Username: 3-16 letters, numbers or _' });
-      if (rude(name) || (/^(admin|mod|system|nix)/i.test(name) && !ADMINS.includes(k))) return send(400, { error: 'That username is not available' });
-      if (pw.length < 8 || pw.length > 100) return send(400, { error: 'Password must be 8-100 characters' });
-      const salt = crypto.randomBytes(16).toString('hex'), h = (await scrypt(pw, salt, 64)).toString('hex');
-      if (DB.users[k]) return send(409, { error: 'That username is taken' });
-      DB.users[k] = { name, salt, h, created: Date.now() }; touch();
-      return start(k, DB.users[k]);
-    }
-    if (url === '/api/login') {
-      if (limited('li' + me, 10, 600e3)) return send(429, { error: 'Too many attempts. Wait a few minutes.' });
-      const k = String(b.username || '').toLowerCase(), u = DB.users[k];
-      if (!(await check(u, b.password)) || u.banned) return send(401, { error: 'Wrong username or password' });
-      return start(k, u);
-    }
-    if (url === '/api/logout') {
-      const t = cookies(req.headers.cookie).nix_sid; if (t) { delete DB.sessions[sha(t)]; touch(); }
-      return send(200, { ok: true }, { 'Set-Cookie': ck('', 0) });
-    }
-    if (url === '/api/delete') {
-      const u = sessionUser(req); if (!u) return send(401, { error: 'Not signed in' });
-      if (!(await check(u, b.password))) return send(401, { error: 'Wrong password' });
-      const k = u.name.toLowerCase();
-      for (const [h, s] of Object.entries(DB.sessions)) if (s.u === k) delete DB.sessions[h];
-      for (const m of DB.msgs.filter(m => m.k === k)) bcast({ t: 'del', id: m.id });
-      DB.msgs = DB.msgs.filter(m => m.k !== k); delete DB.users[k]; touch();
-      for (const c of clients) if (c.k === k) c.sock.destroy();
-      return send(200, { ok: true }, { 'Set-Cookie': ck('', 0) });
-    }
-    send(404, { error: 'Not found' });
-  } catch (e) { send(400, { error: 'Bad request' }); }
+/* ---------- effects ---------- */
+function initFx(){
+  const f=[];for(let i=0;i<70;i++){const v=2+Math.floor(Math.random()*4),x=v+Math.floor(Math.random()*(600-2*v)),y=v+Math.floor(Math.random()*(600-2*v));f.push(`radial-gradient(${v}px ${v}px at ${x}px ${y}px,rgba(255,255,255,${(.5+Math.random()*.5).toFixed(2)}) 50%,transparent)`)}
+  $('#snow').style.setProperty('--flakes',f.join(','));
+  const st=$('#steam');for(let i=0;i<(lowEnd?24:45);i++){const p=document.createElement('div'),s=3+Math.random()*8;p.className='sp';p.style.cssText=`left:${Math.random()*100}%;--sx:${(Math.random()-.5)*120}px;width:${s}px;height:${s}px;animation-duration:${8+Math.random()*14}s;animation-delay:-${Math.random()*12}s;opacity:${.05+Math.random()*.35}`;st.appendChild(p)}
+}
+let fps=0,fc=0,fl=0;
+function dbgLoop(){requestAnimationFrame(function l(t){if(ST.debug){fc++;if(t-fl>=1000){fps=fc;fc=0;fl=t}}requestAnimationFrame(l)});
+  setInterval(()=>{if(ST.debug)$('#dbg').innerHTML=`⚙ DEBUG<br>FPS: ${fps}<br>Games: ${DB.length}<br>Mem: ${performance.memory?Math.round(performance.memory.usedJSHeapSize/1048576)+'MB':'N/A'}<br>${new Date().toLocaleTimeString()}`},1000)}
+
+/* ---------- games ---------- */
+function list(){
+  let g=DB.filter(x=>!q||(x.n+' '+x.c).toLowerCase().includes(q.toLowerCase()));const s=ST.sort;
+  if(s==='az')g.sort((a,b)=>a.n.localeCompare(b.n));else if(s==='za')g.sort((a,b)=>b.n.localeCompare(a.n));
+  else if(s==='recent')g.reverse();else if(s==='played')g.sort((a,b)=>(PLAYED[b.f]||0)-(PLAYED[a.f]||0));
+  else if(s==='favfirst')g.sort((a,b)=>FAVS.includes(b.f)-FAVS.includes(a.f));
+  return g}
+function card(g,i){
+  const d=document.createElement('div'),on=FAVS.includes(g.f);d.className='card'+(ST.anim&&i!=null?' anim':'');d.dataset.f=g.f;
+  if(ST.anim&&i!=null)d.style.animationDelay=Math.min(i*.02,.4)+'s';
+  d.innerHTML=`<div class="em"></div><div class="nm"></div><div class="fav${on?' on':''}">${on?'★':'☆'}</div>${ST.cats?'<div class="cat"></div>':''}`;
+  d.children[0].textContent=g.e;d.children[1].textContent=g.n;if(ST.cats)d.children[3].textContent=g.c;return d}
+function fill(sel,games,anim){const f=document.createDocumentFragment();games.forEach((g,i)=>f.appendChild(card(g,anim?i:null)));$(sel).replaceChildren(f)}
+const lev=(a,b)=>{const dp=Array.from({length:a.length+1},(_,i)=>[i]);for(let j=1;j<=b.length;j++)dp[0][j]=j;for(let i=1;i<=a.length;i++)for(let j=1;j<=b.length;j++)dp[i][j]=a[i-1]===b[j-1]?dp[i-1][j-1]:1+Math.min(dp[i-1][j],dp[i][j-1],dp[i-1][j-1]);return dp[a.length][b.length]};
+function dym(){
+  const ql=q.toLowerCase();let best=null,bd=5;DB.forEach(g=>{const d=lev(ql,g.n.toLowerCase());if(d<bd){bd=d;best=g}});
+  const e=$('#dym');e.textContent='';if(best&&bd<=4){e.append('Did you mean: ');const b=document.createElement('button');b.className='chip';b.dataset.q=best.n;b.textContent=best.e+' '+best.n;e.append(b,'?')}else e.textContent='Try a different search term'}
+function render(){
+  const g=list(),lb=$('#alllbl');fill('#grid',g,true);
+  lb.textContent=q?`Results for "${q}" (${g.length})`:'All Games';lb.classList.toggle('hidden',!g.length);$('#nores').classList.toggle('hidden',!!g.length);if(!g.length)dym();
+  const fv=FAVS.map(byF).filter(Boolean),rc=REC.map(byF).filter(Boolean);
+  $('#favh').classList.toggle('hidden',!fv.length||!!q);fill('#favgrid',fv);
+  $('#rec').classList.toggle('hidden',!ST.recents||!rc.length||!!q);
+  $('#recrow').replaceChildren(...rc.slice(0,14).map(x=>{const c=document.createElement('button');c.className='chip';c.dataset.f=x.f;c.textContent=x.e+' '+x.n;return c}));
+  fill('#favfull',fv);$('#nofav').classList.toggle('hidden',!!fv.length);
+  fill('#recgrid',rc);$('#norec').classList.toggle('hidden',!!rc.length)}
+function toggleFav(f){const i=FAVS.indexOf(f);i<0?FAVS.unshift(f):FAVS.splice(i,1);save();render();modalFav()}
+function modalFav(){if(cur)$('#mfav').textContent=FAVS.includes(cur.f)?'★':'☆'}
+function openGame(g){
+  if(!g)return;cur=g;if(!ST.playNow)return play();
+  $('#gmi').textContent=g.e;$('#gmn').textContent=g.n;$('#gmt').textContent=g.c;
+  $('#gmd').textContent=`Play ${g.n} — a ${g.c.toLowerCase()} game. ${ST.playDesc}`;
+  const p=$('#play');p.textContent='▶ '+(ST.playLabel||'PLAY NOW');p.style.background=ST.playColor;modalFav();$('#modal').classList.add('show')}
+function play(){
+  const g=cur;if(!g)return;$('#modal').classList.remove('show');
+  REC=[g.f,...REC.filter(x=>x!==g.f)].slice(0,20);PLAYED[g.f]=(PLAYED[g.f]||0)+1;save();render();
+  $('#vt').textContent=g.n;const fr=$('#frame'),v=$('#viewer');fr.removeAttribute('srcdoc');v.classList.add('show');
+  fetch(CDN+encodeURIComponent(g.f.includes('.')?g.f:g.f+'.html')).then(r=>{if(!r.ok)throw 0;return r.text()})
+   .then(h=>{if(v.classList.contains('show'))fr.srcdoc=h}).catch(()=>{closeViewer();toast('Failed to load game','err')})}
+function closeViewer(){$('#viewer').classList.remove('show');$('#frame').removeAttribute('srcdoc')}
+function goSec(s){sec=s;['home','favs','recents'].forEach(x=>{$('#s-'+x).classList.toggle('hidden',x!==s)});$$('.tab').forEach(t=>t.classList.toggle('on',t.dataset.sec===s))}
+
+/* ---------- search ---------- */
+function sug(){
+  const b=$('#sug'),m=q?DB.filter(g=>g.n.toLowerCase().startsWith(q.toLowerCase())).slice(0,7):[];
+  b.replaceChildren(...m.map(g=>{const o=document.createElement('button');o.className='opt';o.dataset.q=g.n;o.textContent=g.e+' '+g.n;const s=document.createElement('small');s.textContent=g.c;o.append(s);return o}));
+  b.classList.toggle('open',m.length>0)}
+function setQ(v){q=v.trim();$('#q').value=v;clearTimeout(tm);render();sug();closeDD()}
+function closeDD(){$$('.dd').forEach(d=>d.classList.remove('open'))}
+
+/* ---------- panels ---------- */
+const PANELS={
+ more:()=>['☰ More',S('Wallpaper Manager','<div class="row"><input class="inp" id="wu" placeholder="Paste image URL..." style="margin:0"><button class="btn" style="flex:none" data-act="wallurl">Apply</button></div><div class="row"><button class="btn" data-act="wallfile">⬆ Upload image</button><button class="btn danger" data-act="wallclear">✕ Remove</button></div>')+
+  S('Debug Tools',tg('debug','Debug Overlay','Shows FPS and memory usage'))+S('Advanced Settings',tg('cats','Card Categories','Show category badge on cards')+tg('anim','Card Animations','Entrance animation on game cards'))+
+  S('Import / Export Data',DATA)+S('Changelog','<div class="cl"><b>v3.0</b> Clean rebuild: faster rendering, in-page game viewer, safer storage, settings that save reliably.</div><div class="cl"><b>v2.0</b> Top navigation, new fonts, steam effect, light mode, sort dropdown, background colors, play screen options.</div><div class="cl"><b>v1.0</b> Initial release: 500+ games, settings, snow effect, favorites, recents, search.</div>')+
+  S('Credits','<div class="cl"><b>UGS (Ultimate Game Stash)</b> — game library &amp; hosting<br><b>Nix</b> — frontend portal</div>')],
+ account:()=>['👤 Account',OFF?S('Accounts','<p class="cl">Accounts and chat need the Nix server. Start it with <b>node server.js</b> and open the site from that address.</p>'):ME
+   ?S('Signed in',`<p class="cl">You are signed in as <b>${ME.name}</b>${ME.admin?' (moderator)':''}. Your login is kept in a secure cookie on this device.</p><div class="row"><button class="btn" data-act="logout">Sign out</button><button class="btn danger" data-act="delacc">Delete account</button></div>`)
+   :S('Sign in or create an account',`<input class="inp" id="au" data-auth placeholder="Username (3-16 letters/numbers)" autocomplete="username" maxlength="16"><input class="inp" id="ap" data-auth type="password" placeholder="Password (8+ characters)" autocomplete="current-password"><div class="row"><button class="btn" data-act="login">Log in</button><button class="btn" data-act="signup">Sign up</button></div><p class="cl">No email needed. Use a username that doesn't reveal your real name, and a password you don't use anywhere else.</p>`)],
+ chat:()=>['💬 Global Chat',OFF?S('Chat','<p class="cl">Chat needs the Nix server. Start it with <b>node server.js</b> and open the site from that address.</p>'):!ME
+   ?S('Chat','<p class="cl">Sign in to read and join the chat.</p><button class="btn" style="width:100%" data-open="account">Sign in / Sign up</button>')
+   :`<div class="st" id="onl">Chat</div><div class="msgs" id="msgs"></div><div class="row"><input class="inp" id="cin" maxlength="300" placeholder="Say something friendly..." autocomplete="off" style="margin:0"><button class="btn" style="flex:none" data-act="send">Send</button></div><p class="cl">Be kind. No links or personal info. Messages are logged and moderated; hover a message and tap ⚑ to report it.</p>`],
+ help:()=>['❓ Help',HELP.map(h=>`<details class="hp"><summary>${h.i} ${h.t}</summary><p>${h.b}</p></details>`).join('')]};
+function openPanel(n){const[t,b]=PANELS[n]();$('#pt').textContent=t;$('#pb').innerHTML=b;$('#panel').classList.add('show');apply();if(n==='chat'){UNR=0;badge();drawChat()}}
+function pickFile(accept,cb){const i=document.createElement('input');i.type='file';i.accept=accept;i.onchange=()=>i.files[0]&&cb(i.files[0]);i.click()}
+function setWall(u){const o=ST.wall;ST.wall=u;if(save())apply();else{ST.wall=o;save()}}
+const ACT={
+ play,closeviewer:closeViewer,favmodal:()=>cur&&toggleFav(cur.f),
+ wallurl:()=>{const u=$('#wu').value.trim();u?setWall(u):toast('Enter a URL','err')},
+ wallfile:()=>pickFile('image/*',f=>{const r=new FileReader();r.onload=e=>setWall(e.target.result);r.readAsDataURL(f)}),
+ wallclear:()=>{ST.wall='';save();apply();toast('Wallpaper removed')},
+ bgapply:()=>{const v=$('#bgc').value.trim();if(!v)return;if(!CSS.supports('color',v))return toast('Not a valid color','err');ST.bg=v;save();apply()},
+ export:()=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify({ST,FAVS,REC,PLAYED})],{type:'application/json'}));a.download='nix-settings.json';a.click()},
+ import:()=>pickFile('.json',f=>{const r=new FileReader();r.onload=e=>{try{const d=JSON.parse(e.target.result);if(d.ST)ST={...D,...d.ST};if(Array.isArray(d.FAVS))FAVS=d.FAVS;if(Array.isArray(d.REC||d.RECENTS))REC=d.REC||d.RECENTS;if(d.PLAYED)PLAYED=d.PLAYED;save();location.reload()}catch{toast('Invalid settings file','err')}};r.readAsText(f)}),
+ reset:()=>{if(confirm('Reset all settings, favorites and recents?')){Object.values(K).forEach(k=>localStorage.removeItem(k));location.reload()}}};
+
+/* ---------- events ---------- */
+document.addEventListener('click',e=>{
+  const c=s=>e.target.closest(s);let t;
+  if(!c('.dd,[data-dd],.sw'))closeDD();
+  if(e.target.classList.contains('ov')||c('[data-close]')){$('#modal').classList.remove('show');$('#panel').classList.remove('show')}
+  if(t=c('[data-act]'))ACT[t.dataset.act]();
+  else if(t=c('[data-set]')){const[k,...v]=t.dataset.set.split(':');set(k,v.join(':'));if(k==='sort')closeDD()}
+  else if(t=c('[data-dd]')){const d=$('#'+t.dataset.dd),o=d.classList.contains('open');closeDD();d.classList.toggle('open',!o)}
+  else if(t=c('[data-rep]'))report(+t.dataset.rep);
+  else if(t=c('[data-open]'))openPanel(t.dataset.open);
+  else if(t=c('[data-sec]'))goSec(t.dataset.sec);
+  else if(t=c('[data-q]'))setQ(t.dataset.q);
+  else if(t=c('[data-bg]')){ST.bg=t.dataset.bg;save();apply();$('#bgc').value=ST.bg}
+  else if(t=c('[data-ac]')){[ST.hue,ST.sat,ST.bri]=t.dataset.ac.split(',').map(Number);save();apply();$$('[data-r]').forEach(r=>r.value=ST[r.dataset.r])}
+  else if(c('.fav'))toggleFav(c('.card').dataset.f);
+  else if(t=c('.card,.chip[data-f]'))openGame(byF(t.dataset.f));
 });
-
-/* ---------- WebSocket chat (RFC 6455, text frames only) ---------- */
-const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11', clients = new Set();
-function frame(op, data) {
-  const p = Buffer.from(data), n = p.length; let h;
-  if (n < 126) h = Buffer.from([0x80 | op, n]); else if (n < 65536) h = Buffer.from([0x80 | op, 126, n >> 8, n & 255]);
-  else { h = Buffer.alloc(10); h[0] = 0x80 | op; h[1] = 127; h.writeBigUInt64BE(BigInt(n), 2); }
-  return Buffer.concat([h, p]);
-}
-const wsend = (c, o) => { if (!c.sock.destroyed) c.sock.write(frame(1, JSON.stringify(o))); };
-const bcast = o => { const f = frame(1, JSON.stringify(o)); for (const c of clients) if (!c.sock.destroyed) c.sock.write(f); };
-const online = () => bcast({ t: 'online', n: new Set([...clients].map(c => c.k)).size });
-const pm = m => ({ id: m.id, u: m.u, ts: m.ts, x: m.x });
-
-server.on('upgrade', (req, sock) => {
-  const u = req.url.split('?')[0] === '/ws' && originOk(req) && sessionUser(req), key = req.headers['sec-websocket-key'];
-  if (!u || !key || limited('ws' + ip(req), 30, 60e3)) return sock.end('HTTP/1.1 403 Forbidden\r\n\r\n');
-  sock.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + crypto.createHash('sha1').update(key + GUID).digest('base64') + '\r\n\r\n');
-  const c = { sock, k: u.name.toLowerCase(), name: u.name, buf: Buffer.alloc(0), last: 0, alive: true };
-  clients.add(c);
-  wsend(c, { t: 'hist', msgs: DB.msgs.slice(-50).map(pm), online: new Set([...clients].map(x => x.k)).size });
-  online();
-  const gone = () => { if (clients.delete(c)) online(); };
-  sock.on('close', gone); sock.on('error', () => sock.destroy());
-  sock.on('data', d => {
-    c.buf = Buffer.concat([c.buf, d]); if (c.buf.length > 8192) return sock.destroy();
-    for (; ;) {
-      const b = c.buf; if (b.length < 2) break;
-      const fin = b[0] & 128, op = b[0] & 15, masked = b[1] & 128; let n = b[1] & 127, o = 2;
-      if (n === 126) { if (b.length < 4) break; n = b.readUInt16BE(2); o = 4; } else if (n === 127) { if (b.length < 10) break; n = Number(b.readBigUInt64BE(2)); o = 10; }
-      if (!masked || !fin || n > 2048) return sock.destroy();
-      if (b.length < o + 4 + n) break;
-      const m = b.subarray(o, o + 4), p = Buffer.from(b.subarray(o + 4, o + 4 + n)); for (let i = 0; i < n; i++) p[i] ^= m[i & 3];
-      c.buf = b.subarray(o + 4 + n);
-      if (op === 8) { sock.end(frame(8, '')); return; }
-      else if (op === 9) sock.write(frame(10, p));
-      else if (op === 10) c.alive = true;
-      else if (op === 1) onMsg(c, p.toString('utf8'));
-      else return sock.destroy();
-    }
-  });
+document.addEventListener('change',e=>{const k=e.target.dataset.k;if(k)set(k,e.target.checked)});
+document.addEventListener('input',e=>{
+  const t=e.target;
+  if(t.dataset.r){ST[t.dataset.r]=+t.value;save();apply()}
+  else if(t.dataset.t){ST[t.dataset.t]=t.value;save();apply()}
 });
-setInterval(() => { for (const c of clients) { if (!c.alive) { c.sock.destroy(); continue; } c.alive = false; c.sock.write(frame(9, '')); } }, 30000);
+$('#q').addEventListener('input',e=>{q=e.target.value.trim();clearTimeout(tm);tm=setTimeout(render,90);sug()});
+$('#q').addEventListener('focus',sug);
+$('#q').addEventListener('keydown',e=>{if(e.key==='Escape')setQ('')});
+document.addEventListener('keydown',e=>{if(e.key!=='Escape')return;if($('#viewer').classList.contains('show'))closeViewer();else{$('#modal').classList.remove('show');$('#panel').classList.remove('show');closeDD()}});
 
-function onMsg(c, raw) {
-  let d; try { d = JSON.parse(raw); } catch { return; }
-  const u = DB.users[c.k]; if (!u || u.banned) return c.sock.destroy();
-  const err = m => wsend(c, { t: 'err', m });
-  if (d.t === 'report') {
-    const m = DB.msgs.find(x => x.id === d.id); if (!m || limited('rp' + c.k, 5, 60e3)) return;
-    DB.reports.push({ id: m.id, u: m.u, x: m.x, by: c.name, ts: Date.now() }); DB.reports = DB.reports.slice(-100); touch();
-    console.log('REPORT', m.id, m.u, JSON.stringify(m.x), 'by', c.name); return wsend(c, { t: 'sys', m: 'Thanks, the message was reported to the moderators.' });
-  }
-  if (d.t !== 'msg') return;
-  const text = String(d.x || '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim(), n = Date.now();
-  if (!text) return;
-  if (text[0] === '/') return command(c, u, text, err);
-  if (u.mutedUntil > n) return err('You are muted for ' + Math.ceil((u.mutedUntil - n) / 60000) + ' more minute(s).');
-  if (n - c.last < 1200 || limited('m' + c.k, 20, 60e3)) return err('Slow down a little.');
-  if (text.length > 300) return err('Messages can be up to 300 characters.');
-  if (LINK.test(text)) return err('Links and contact info are not allowed in chat.');
-  if (rude(text)) return err('Please keep it friendly.');
-  c.last = n; const m = { id: DB.nextId++, u: u.name, k: c.k, ts: n, x: text };
-  DB.msgs.push(m); if (DB.msgs.length > 200) DB.msgs.shift(); touch(); bcast({ t: 'msg', m: pm(m) });
-}
-function command(c, u, text, err) {
-  if (!isAdmin(u)) return err('Unknown command.');
-  const [cmd, a, b] = text.slice(1).split(' '), target = DB.users[String(a || '').toLowerCase()], sys = m => wsend(c, { t: 'sys', m });
-  if (cmd === 'del') { const id = +a; if (!DB.msgs.some(m => m.id === id)) return err('No such message.'); DB.msgs = DB.msgs.filter(m => m.id !== id); touch(); return bcast({ t: 'del', id }); }
-  if (cmd === 'mute' && target) { target.mutedUntil = Date.now() + (+b || 10) * 60000; touch(); return sys(target.name + ' muted for ' + (+b || 10) + ' min.'); }
-  if (cmd === 'unmute' && target) { target.mutedUntil = 0; touch(); return sys(target.name + ' unmuted.'); }
-  if (cmd === 'ban' && target) {
-    target.banned = true; const k = target.name.toLowerCase(); touch();
-    for (const [h, s] of Object.entries(DB.sessions)) if (s.u === k) delete DB.sessions[h];
-    for (const x of clients) if (x.k === k) x.sock.destroy(); return sys(target.name + ' banned.');
-  }
-  if (cmd === 'reports') return sys(DB.reports.slice(-5).map(r => `#${r.id} ${r.u}: "${r.x}" (by ${r.by})`).join(' | ') || 'No reports.');
-  err('Commands: /del id, /mute name [min], /unmute name, /ban name, /reports');
-}
+/* ---------- accounts & chat (requires server.js) ---------- */
+let ME=null,WS=null,MSGS=[],ONL=0,UNR=0,retry=0,OFF=false;
+async function api(p,b){try{const r=await fetch('/api/'+p,{method:b?'POST':'GET',headers:b?{'Content-Type':'application/json'}:{},body:b?JSON.stringify(b):undefined});const j=await r.json().catch(()=>({}));return r.ok?j:{error:j.error||'Request failed'}}catch{return{error:'Server not reachable',off:1}}}
+async function loadMe(){const j=await api('me');OFF=!!j.off;ME=j.user||null;ME?connect():closeWS();badge()}
+const chatOpen=()=>$('#panel').classList.contains('show')&&!!$('#msgs');
+function badge(){const b=$('#cbadge');b.textContent=UNR>9?'9+':UNR;b.classList.toggle('hidden',!UNR)}
+function closeWS(){const w=WS;WS=null;MSGS=[];if(w)try{w.close()}catch{}}
+function connect(){
+  if(WS||!ME)return;let w;try{w=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws')}catch{return}
+  WS=w;w.onopen=()=>{retry=0};
+  w.onmessage=e=>{let d;try{d=JSON.parse(e.data)}catch{return}
+    if(d.t==='hist'){MSGS=d.msgs;ONL=d.online}
+    else if(d.t==='msg'){MSGS.push(d.m);if(MSGS.length>200)MSGS.shift();if(!chatOpen()&&d.m.u!==ME.name){UNR++;badge()}}
+    else if(d.t==='del')MSGS=MSGS.filter(m=>m.id!==d.id);
+    else if(d.t==='online')ONL=d.n;
+    else MSGS.push({id:0,sys:1,x:d.m});
+    drawChat()};
+  w.onclose=()=>{if(WS!==w)return;WS=null;if(ME&&retry<6)setTimeout(connect,Math.min(1000*2**retry++,15000));drawChat()}}
+function drawChat(){
+  const box=$('#msgs');if(!box)return;const stick=box.scrollHeight-box.scrollTop-box.clientHeight<40;
+  $('#onl').textContent=WS&&WS.readyState===1?`● ${ONL} online`:'Connecting...';
+  box.replaceChildren(...MSGS.map(m=>{const d=document.createElement('div');d.className='m'+(m.sys?' sys':'');
+    if(m.sys)d.textContent=m.x;else{const b=document.createElement('b');b.textContent=m.u;const s=document.createElement('small');s.textContent=new Date(m.ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+      const f=document.createElement('i');f.textContent='⚑';f.title='Report';f.dataset.rep=m.id;d.append(b,': ',m.x,s,f)}return d}));
+  if(stick)box.scrollTop=box.scrollHeight}
+function report(id){if(WS&&WS.readyState===1)WS.send(JSON.stringify({t:'report',id}))}
+async function auth(p){const u=$('#au').value.trim(),pw=$('#ap').value;if(!u||!pw)return toast('Enter a username and password','err');
+  const j=await api(p,{username:u,password:pw});if(j.error)return toast(j.error,'err');ME=j.user;OFF=false;connect();toast('Welcome, '+ME.name);openPanel('chat')}
+Object.assign(ACT,{
+  login:()=>auth('login'),signup:()=>auth('signup'),
+  logout:async()=>{await api('logout',{});ME=null;closeWS();UNR=0;badge();toast('Signed out');openPanel('account')},
+  delacc:async()=>{const pw=prompt('Enter your password to permanently delete your account and messages:');if(!pw)return;const j=await api('delete',{password:pw});if(j.error)return toast(j.error,'err');ME=null;closeWS();badge();toast('Account deleted');openPanel('account')},
+  send:()=>{const i=$('#cin'),x=i.value.trim();if(!x)return;if(!WS||WS.readyState!==1)return toast('Not connected','err');WS.send(JSON.stringify({t:'msg',x}));i.value='';i.focus()}});
+document.addEventListener('keydown',e=>{if(e.key!=='Enter')return;if(e.target.id==='cin')ACT.send();else if(e.target.dataset.auth!==undefined)ACT.login()});
 
-server.listen(PORT, () => console.log('Nix running on http://localhost:' + PORT + (ADMINS.length ? ' (admins: ' + ADMINS.join(', ') + ')' : ' (set ADMINS=yourname to enable moderation)')));
+/* ---------- init ---------- */
+buildSettings();apply();initFx();render();dbgLoop();
+loadMe();
+setTimeout(()=>$('#loader').classList.add('hide'),1300);
+</script>
+</body>
+</html>
