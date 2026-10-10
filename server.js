@@ -3,7 +3,7 @@
 // No dependencies. Run: node server.js   (Node 18+)
 const http = require('http'), crypto = require('crypto'), fs = require('fs'), path = require('path'), { promisify } = require('util');
 const scrypt = promisify(crypto.scrypt), E = process.env;
-const PORT = +E.PORT || 3000, PROD = E.NODE_ENV === 'production';
+const PORT = process.env.PORT || +E.PORT || 3000, PROD = E.NODE_ENV === 'production';
 const list = s => (s || '').split(',').map(x => x.trim()).filter(Boolean);
 const ADMINS = list(E.ADMINS).map(x => x.toLowerCase());       // usernames that can moderate
 const ORIGINS = list(E.ALLOWED_ORIGINS);                         // extra origins allowed to call the API
