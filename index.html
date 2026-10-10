@@ -620,7 +620,8 @@ const chatOpen=()=>$('#panel').classList.contains('show')&&!!$('#msgs');
 function badge(){const b=$('#cbadge');b.textContent=UNR>9?'9+':UNR;b.classList.toggle('hidden',!UNR)}
 function closeWS(){const w=WS;WS=null;MSGS=[];if(w)try{w.close()}catch{}}
 function connect(){
-  if(WS||!ME)return;let w;try{w=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws')}catch{return}
+if(WS||!ME)return;let w;try{w=new WebSocket('wss://://onrender.com')}catch{return}
+
   WS=w;w.onopen=()=>{retry=0};
   w.onmessage=e=>{let d;try{d=JSON.parse(e.data)}catch{return}
     if(d.t==='hist'){MSGS=d.msgs;ONL=d.online}
